@@ -1,0 +1,16 @@
+{
+  "name": "epharma-management-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "E-Pharma Management System — connects medical stores, doctors and patients",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "bash test.sh"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

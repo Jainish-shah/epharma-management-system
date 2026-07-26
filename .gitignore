@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# SQLite runtime database (regenerated + seeded on first run)
+epharma.db
+epharma.db-wal
+epharma.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor cruft
+.DS_Store
+*.log
+
+# MS Word lock/owner temp files
+~$*
