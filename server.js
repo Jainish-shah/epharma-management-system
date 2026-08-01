@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { db, hashPassword, verifyPassword } = require('./db');
 const payments = require('./payments');
+const { TOPICS, publish, subscribe, initKafka } = require('./events');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,12 +25,32 @@ const publicUser = (u) => {
   return rest;
 };
 
-const notify = (userId, message) =>
-  db.prepare('INSERT INTO notifications (user_id, message) VALUES (?, ?)').run(userId, message);
+// Notifications are now an event, not a direct DB write: publishers emit to the NOTIFICATIONS topic
+// and the notification service (subscriber below) persists them. Decouples every producer from storage
+// and lets other services (email/SMS) subscribe to the same stream.
+const notify = (userId, message) => publish(TOPICS.NOTIFICATIONS, { userId, message });
 
 const notifyAdmins = (message) => {
   for (const a of db.prepare("SELECT id FROM users WHERE role = 'admin'").all()) notify(a.id, message);
 };
+
+// ---- event consumers (the "services" fed by the stream) ----
+// Notification service: persist every notification event.
+subscribe(TOPICS.NOTIFICATIONS, ({ userId, message }) => {
+  db.prepare('INSERT INTO notifications (user_id, message) VALUES (?, ?)').run(userId, message);
+});
+
+// Payment service: on a successful payment, issue the patient's receipt notification.
+// (A real deployment could also fan this out to email/accounting consumers on the same topic.)
+subscribe(TOPICS.PAYMENTS, ({ orderId, patientId, amount }) => {
+  console.log(`[payments] order #${orderId} paid: ₹${(amount / 100).toFixed(2)}`);
+  notify(patientId, `Payment received: ₹${(amount / 100).toFixed(2)} for order #${orderId}`);
+});
+
+// Order/analytics service: a second consumer on the stream, demonstrating fan-out.
+subscribe(TOPICS.ORDERS, ({ orderId, pharmacyId, total }) => {
+  console.log(`[orders] order #${orderId} placed with pharmacy ${pharmacyId} (₹${total.toFixed(2)})`);
+});
 
 // Phase 3: turn any due, un-notified refill reminders into notifications. Checked on-access
 // (when the patient fetches notifications) so no background scheduler is needed for the demo.
@@ -63,6 +84,10 @@ function issueToken(userId) {
   db.prepare('INSERT INTO tokens (token, user_id) VALUES (?, ?)').run(token, userId);
   return token;
 }
+
+// ---------- public config ----------
+// Lets the client show the active payment provider without hard-coding it.
+app.get('/api/config', (req, res) => res.json({ paymentProvider: payments.provider, mock: payments.IS_MOCK }));
 
 // ---------- auth ----------
 
@@ -239,16 +264,18 @@ function priceCart(items) {
 app.post('/api/payments/create', auth('patient'), (req, res) => {
   try {
     const { total } = priceCart(req.body.items);
-    const amount = Math.round(total * 100); // paise
-    const providerOrder = payments.createOrder(amount);
+    const amount = Math.round(total * 100); // smallest currency unit
+    const intent = payments.createIntent(amount);
     db.prepare('INSERT INTO payments (provider_order_id, patient_id, amount) VALUES (?, ?, ?)')
-      .run(providerOrder.id, req.user.id, amount);
+      .run(intent.id, req.user.id, amount);
     res.json({
-      providerOrderId: providerOrder.id,
+      provider: payments.provider,
+      providerOrderId: intent.id,
       amount,
-      currency: 'INR',
-      key: providerOrder.key,
-      demoCheckout: payments.IS_MOCK ? payments.mockCheckout(providerOrder.id) : undefined,
+      currency: intent.currency,
+      key: intent.key,
+      clientSecret: intent.clientSecret,
+      demoCheckout: payments.IS_MOCK ? payments.mockCheckout(intent.id) : undefined,
     });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -263,13 +290,14 @@ app.post('/api/orders', auth('patient'), (req, res) => {
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
   if (type === 'delivery' && !address) return res.status(400).json({ error: 'Delivery address is required' });
 
-  // Phase 3: verify the payment before creating the order.
-  if (!payment || !payment.razorpay_order_id) return res.status(402).json({ error: 'Payment required' });
+  // Phase 3: verify the payment (provider-neutral) before creating the order.
+  const providerOrderId = payment && payments.orderIdOf(payment);
+  if (!providerOrderId) return res.status(402).json({ error: 'Payment required' });
   const pay = db.prepare('SELECT * FROM payments WHERE provider_order_id = ? AND patient_id = ?')
-    .get(payment.razorpay_order_id, req.user.id);
+    .get(providerOrderId, req.user.id);
   if (!pay || pay.status !== 'created') return res.status(402).json({ error: 'Unknown or already-used payment' });
-  if (!payments.verify(payment.razorpay_order_id, payment.razorpay_payment_id, payment.razorpay_signature)) {
-    return res.status(402).json({ error: 'Payment signature verification failed' });
+  if (!payments.verify(providerOrderId, payment)) {
+    return res.status(402).json({ error: 'Payment verification failed' });
   }
 
   // node:sqlite has no transaction helper — manual BEGIN/COMMIT
@@ -313,6 +341,9 @@ app.post('/api/orders', auth('patient'), (req, res) => {
     }
 
     db.prepare("UPDATE payments SET status = 'paid', order_id = ? WHERE id = ?").run(orderId, pay.id);
+    // Emit domain events; the notification/payment services (subscribers) react to these.
+    publish(TOPICS.ORDERS, { orderId, pharmacyId, patientId: req.user.id, total });
+    publish(TOPICS.PAYMENTS, { orderId, patientId: req.user.id, amount: pay.amount });
     notify(pharmacyId, `New order #${orderId} received (₹${total.toFixed(2)})`);
     return orderId;
   };
@@ -559,6 +590,8 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`E-Pharma running at http://localhost:${PORT}`);
+  console.log(`Payment provider: ${payments.provider}${payments.IS_MOCK ? ' (mock/sandbox)' : ''}`);
+  initKafka().catch((e) => console.error('[events] Kafka init failed, using in-process bus:', e.message));
   console.log('Demo logins:');
   console.log('  admin@epharma.com / admin123   (Admin)');
   console.log('  asha@epharma.com  / doctor123  (Doctor, approved)');

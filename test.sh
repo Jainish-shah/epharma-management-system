@@ -19,16 +19,16 @@ jget() { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
 assert_eq() { [ "$1" = "$2" ] || { echo "FAIL: $3 (expected '$2', got '$1')"; exit 1; }; echo "ok: $3"; }
 
 # Phase 3: create a payment intent for the given items, then place the paid order. Echoes order JSON.
-# $1 token · $2 items JSON array · $3 extra order fields (e.g. '"type":"delivery","address":"X"')
+# Provider-neutral: passes the opaque demoCheckout object straight back as `payment`.
+# $1 token · $2 items JSON array · $3 extra order fields as a JSON object (e.g. '{"type":"pickup"}')
 pay_and_order() {
-  local tok=$1 items=$2 extra=$3
-  local pay pid sig oid
+  local tok=$1 items=$2 extra=${3:-'{}'}
+  local pay body
   pay=$(curl -s $J -H "Authorization: Bearer $tok" -d "{\"items\":$items}" $B/payments/create)
-  oid=$(echo "$pay" | jget '["providerOrderId"]')
-  pid=$(echo "$pay" | jget '["demoCheckout"]["razorpay_payment_id"]')
-  sig=$(echo "$pay" | jget '["demoCheckout"]["razorpay_signature"]')
-  curl -s $J -H "Authorization: Bearer $tok" \
-    -d "{\"items\":$items,$extra,\"payment\":{\"razorpay_order_id\":\"$oid\",\"razorpay_payment_id\":\"$pid\",\"razorpay_signature\":\"$sig\"}}" $B/orders
+  body=$(python3 -c "import json,sys
+pay=json.loads(sys.argv[1]); items=json.loads(sys.argv[2]); extra=json.loads(sys.argv[3])
+print(json.dumps({**extra, 'items': items, 'payment': pay['demoCheckout']}))" "$pay" "$items" "$extra")
+  curl -s $J -H "Authorization: Bearer $tok" -d "$body" $B/orders
 }
 
 # --- patient: login, order, book appointment ---
@@ -42,7 +42,7 @@ NOPAY=$(curl -s $J -H "Authorization: Bearer $PT" \
   -d '{"items":[{"medicine_id":1,"qty":1}],"type":"pickup"}' $B/orders | jget '["error"]')
 assert_eq "$NOPAY" "Payment required" "order without payment rejected"
 
-ORDER=$(pay_and_order "$PT" '[{"medicine_id":1,"qty":2}]' '"type":"delivery","address":"Test Lane"')
+ORDER=$(pay_and_order "$PT" '[{"medicine_id":1,"qty":2}]' '{"type":"delivery","address":"Test Lane"}')
 assert_eq "$(echo "$ORDER" | jget '["status"]')" "pending" "order placed after payment verified"
 OID=$(echo "$ORDER" | jget '["id"]')
 
@@ -130,14 +130,26 @@ assert_eq "$PTDOC" "Not allowed for your role" "patient blocked from document up
 
 # ============ Phase 3: payments, consultation, refills ============
 
-# --- payment signature verification ---
-PC=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"items":[{"medicine_id":5,"qty":1}]}' $B/payments/create)
-POID=$(echo "$PC" | jget '["providerOrderId"]')
-assert_eq "${POID:0:6}" "order_" "payment intent created with provider order id"
+# --- payment provider + signature verification ---
+CFG=$(curl -s $B/config | jget '["paymentProvider"]')
+assert_eq "$CFG" "stripe" "config exposes active payment provider (stripe)"
 
-BADSIG=$(curl -s $J -H "Authorization: Bearer $PT" \
-  -d "{\"items\":[{\"medicine_id\":5,\"qty\":1}],\"type\":\"pickup\",\"payment\":{\"razorpay_order_id\":\"$POID\",\"razorpay_payment_id\":\"pay_x\",\"razorpay_signature\":\"deadbeef\"}}" $B/orders | jget '["error"]')
-assert_eq "$BADSIG" "Payment signature verification failed" "tampered payment signature rejected"
+PC=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"items":[{"medicine_id":5,"qty":1}]}' $B/payments/create)
+assert_eq "$(echo "$PC" | jget '["provider"]')" "stripe" "payment intent uses stripe"
+POID=$(echo "$PC" | jget '["providerOrderId"]')
+assert_eq "${POID:0:3}" "pi_" "stripe PaymentIntent id issued"
+
+BADBODY=$(python3 -c "import json,sys
+pc=json.loads(sys.argv[1]); dc=dict(pc['demoCheckout'])
+for k in ('proof','razorpay_signature'):
+    if k in dc: dc[k]='tampered'
+print(json.dumps({'items':[{'medicine_id':5,'qty':1}],'type':'pickup','payment':dc}))" "$PC")
+BADSIG=$(curl -s $J -H "Authorization: Bearer $PT" -d "$BADBODY" $B/orders | jget '["error"]')
+assert_eq "$BADSIG" "Payment verification failed" "tampered payment rejected"
+
+# --- event stream: a paid order emits a receipt notification (payments -> notifications topic) ---
+RCPT=$(curl -s -H "Authorization: Bearer $PT" $B/notifications | python3 -c "import sys,json;print(any('Payment received' in n['message'] for n in json.load(sys.stdin)))")
+assert_eq "$RCPT" "True" "payment event produces a receipt notification"
 
 # --- teleconsultation chat (AID is a confirmed/completed appointment between PT and DR) ---
 MSG=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"body":"Hello doctor"}' $B/appointments/$AID/messages | jget '["body"]')

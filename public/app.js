@@ -4,6 +4,7 @@ let token = localStorage.getItem('token');
 let user = JSON.parse(localStorage.getItem('user') || 'null');
 let cart = []; // { medicine_id, name, price, qty, store_name }
 let activeTab = null;
+let config = { paymentProvider: 'stripe', mock: true }; // filled from /api/config at boot
 
 const $ = (sel) => document.querySelector(sel);
 const app = $('#app');
@@ -370,7 +371,7 @@ function showCart() {
     <input id="orderAddress" value="${esc(user.address || '')}" placeholder="Full address" />
     <label>Attach prescription (optional, image)</label>
     <input id="orderRx" type="file" accept="image/*" />
-    <div class="meta" style="margin-top:10px">🔒 Payments via Razorpay (sandbox)</div>
+    <div class="meta" style="margin-top:10px">🔒 Payments via ${esc(config.paymentProvider[0].toUpperCase() + config.paymentProvider.slice(1))}${config.mock ? ' (sandbox)' : ''}</div>
     <div class="actions">
       <button class="btn secondary" onclick="closeModal()">Keep shopping</button>
       <button class="btn" onclick="placeOrder()">Pay ${money(total)}</button>
@@ -846,4 +847,5 @@ function render() {
   else renderLanding();
 }
 
-render();
+// Load the active payment provider (Stripe/Razorpay) for the checkout label, then render.
+api('/api/config').then((c) => { config = c; }).catch(() => {}).finally(render);

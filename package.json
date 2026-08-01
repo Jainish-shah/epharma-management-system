@@ -12,5 +12,8 @@
   },
   "dependencies": {
     "express": "^4.21.2"
+  },
+  "optionalDependencies": {
+    "kafkajs": "^2.2.4"
   }
 }

@@ -23,13 +23,26 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 ┌──────────────────────▼──────────────────────────┐
 │           REST API (Node.js + Express)          │
 │  Auth (token) · RBAC middleware · Business logic│
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐
-│                 SQLite database                 │
-│  users · medicines · orders · order_items ·     │
-│  appointments · prescriptions · notifications   │
-└─────────────────────────────────────────────────┘
+└───────┬───────────────────────────────┬─────────┘
+        │                               │ publish
+        │                    ┌──────────▼───────────────────────┐
+        │                    │  Event bus (in-process / Kafka)  │
+        │                    │  topics: orders · payments ·     │
+        │                    │  appointments · notifications    │
+        │                    └──────────┬───────────────────────┘
+        │                               │ consumers
+        │                    ┌──────────▼───────────────────────┐
+        │                    │ notification svc · payment svc · │
+        │                    │ analytics (subscribe to topics)  │
+        │                    └──────────┬───────────────────────┘
+        │ external                      │
+┌───────▼──────────┐          ┌─────────▼───────────────────────┐
+│ Stripe / Razorpay│          │          SQLite database         │
+│ (sandbox/live)   │          │ users · medicines · orders ·     │
+└──────────────────┘          │ order_items · appointments ·     │
+                              │ prescriptions · notifications ·  │
+                              │ payments · messages · refills    │
+                              └──────────────────────────────────┘
 ```
 
 **Design decisions**
@@ -41,6 +54,8 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | SQLite (built-in `node:sqlite`) | Zero-config, transactional, no native deps; clean migration path to PostgreSQL for production scale |
 | Vanilla JS SPA, no build step | No toolchain risk; runs anywhere Node ≥ 22.5 runs |
 | Role checks in one `auth(...roles)` middleware | RBAC enforced at the route boundary, single point of audit |
+| Event bus abstraction (in-process default, Kafka opt-in) | Decouples producers (orders/payments) from consumers (notifications/receipts); scales to multiple instances via Kafka without changing business logic |
+| Payment-provider façade (Stripe / Razorpay) | Uniform verified-checkout flow; provider is a config switch, mock providers keep it fully testable |
 
 ## 3. Core Module Analysis
 
@@ -109,7 +124,7 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 
 ## 8. Testing Strategy
 
-- **Now:** automated end-to-end API suite (`npm test`) — 35 assertions covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, payment signature verification, teleconsultation chat access control, and refill reminders. Runs against a throwaway database.
+- **Now:** automated end-to-end API suite (`npm test`) — 38 assertions covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, and refill reminders. Runs against a throwaway database.
 - **Later phases:** browser automation for critical UI flows, load test before deployment.
 
 ## 9. Risks & Mitigations

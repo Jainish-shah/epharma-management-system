@@ -3,7 +3,7 @@
 Integrated platform connecting patients, doctors and pharmacies — prescription-based ordering,
 teleconsultation booking, inventory management and admin oversight.
 
-**Stack:** Node.js + Express (REST API) · SQLite via built-in `node:sqlite` (zero config) · Vanilla JS SPA (no build step)
+**Stack:** Node.js + Express (REST API) · SQLite via built-in `node:sqlite` (zero config) · Vanilla JS SPA (no build step) · event streaming (in-process bus, optional Apache Kafka) · Stripe/Razorpay payments (sandbox)
 
 ## Run
 
@@ -85,10 +85,14 @@ for the analysis document and development plan, and
 
 ### Phase 3 additions (commerce & consultation)
 
-- **Payments** — Razorpay-shaped checkout: a payment intent is created for the cart, then the order is
-  placed only after the server verifies the HMAC-SHA256 payment signature and that the paid amount
-  matches the recomputed cart total. Ships with a built-in mock provider (fully testable); going live
-  is a config change (`RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`) — see [payments.js](payments.js).
+- **Payments (Stripe / Razorpay)** — provider-neutral checkout: a payment intent is created for the cart,
+  then the order is placed only after the server verifies the payment and that the paid amount matches the
+  recomputed cart total. Both providers ship a built-in mock (fully testable); pick one with
+  `PAYMENT_PROVIDER` (default `stripe`) and go live by setting real keys — see [payments.js](payments.js).
+- **Event streaming (Kafka)** — orders, payments and notifications are published to topics and handled by
+  independent consumers (notification service persists messages; payment service issues receipts), so
+  producers are decoupled from consumers. Runs on an in-process bus by default; set `KAFKA_BROKERS` to
+  stream through Apache Kafka (see [events.js](events.js), [docker-compose.yml](docker-compose.yml)).
 - **Teleconsultation** — per-appointment chat (backed by the `messages` table, live-polled in the UI)
   and a deterministic, unguessable Jitsi video room per appointment. Opens once the appointment is confirmed;
   only the two parties can access it.
@@ -102,6 +106,7 @@ for the analysis document and development plan, and
 | Payments | `POST /api/payments/create` (patient — payment intent for the cart) |
 | Consultation | `GET/POST /api/appointments/:id/messages`, `GET /api/appointments/:id/room` (patient/doctor party only) |
 | Refills | `GET /api/refills` (patient) |
+| Config (public) | `GET /api/config` (active payment provider) |
 
 ### Full endpoint reference
 
@@ -116,10 +121,33 @@ for the analysis document and development plan, and
 | Notifications | `GET /api/notifications`, `POST /api/notifications/read` |
 | Admin | `GET /api/admin/users`, `PATCH /api/admin/users/:id`, `GET /api/admin/stats` |
 
+## Configuration (environment variables)
+
+All optional — the app runs with sensible defaults and no configuration.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP port |
+| `PAYMENT_PROVIDER` | `stripe` | `stripe` or `razorpay` |
+| `STRIPE_SECRET_KEY` / `STRIPE_PUBLISHABLE_KEY` | mock | live Stripe keys (else mock provider) |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | mock | live Razorpay keys (else mock provider) |
+| `KAFKA_BROKERS` | _(unset)_ | e.g. `localhost:9092` — stream events through Kafka instead of the in-process bus |
+| `REFILL_DAYS` | `30` | days after an order before a refill reminder is due |
+
+**Run with real Kafka:**
+
+```bash
+docker compose up -d          # local single-node Kafka broker
+npm i kafkajs                 # optional dependency, loaded only when KAFKA_BROKERS is set
+KAFKA_BROKERS=localhost:9092 npm start
+```
+
 ## Deliberate simplifications (current scope)
 
-- **Payments** run on a built-in mock provider; the signature-verification flow is production-identical,
-  so going live is just setting real Razorpay keys.
+- **Payments** run on a built-in mock provider (Stripe or Razorpay); verification is production-identical,
+  so going live is just setting real keys.
+- **Event streaming** defaults to an in-process bus (synchronous, single process); real Kafka is opt-in via
+  `KAFKA_BROKERS` and demonstrates the multi-consumer, decoupled architecture.
 - **Video** uses public `meet.jit.si` (no custom WebRTC signaling/TURN server this phase); **chat** live-updates
   by polling (SSE/WebSocket is the production upgrade).
 - **OTP** delivery is demo-mode (code returned/logged) until an SMS/email gateway is wired.
