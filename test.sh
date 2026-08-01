@@ -6,6 +6,7 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export EPHARMA_DB=$(mktemp -d)/test.db
 export PORT=3999
+export REFILL_DAYS=0   # refills immediately due, so the materialisation path is testable in one run
 B="http://localhost:$PORT/api"
 J='-H Content-Type:application/json'
 
@@ -17,6 +18,19 @@ for i in $(seq 1 20); do curl -s "$B/medicines" >/dev/null && break; sleep 0.25;
 jget() { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
 assert_eq() { [ "$1" = "$2" ] || { echo "FAIL: $3 (expected '$2', got '$1')"; exit 1; }; echo "ok: $3"; }
 
+# Phase 3: create a payment intent for the given items, then place the paid order. Echoes order JSON.
+# $1 token · $2 items JSON array · $3 extra order fields (e.g. '"type":"delivery","address":"X"')
+pay_and_order() {
+  local tok=$1 items=$2 extra=$3
+  local pay pid sig oid
+  pay=$(curl -s $J -H "Authorization: Bearer $tok" -d "{\"items\":$items}" $B/payments/create)
+  oid=$(echo "$pay" | jget '["providerOrderId"]')
+  pid=$(echo "$pay" | jget '["demoCheckout"]["razorpay_payment_id"]')
+  sig=$(echo "$pay" | jget '["demoCheckout"]["razorpay_signature"]')
+  curl -s $J -H "Authorization: Bearer $tok" \
+    -d "{\"items\":$items,$extra,\"payment\":{\"razorpay_order_id\":\"$oid\",\"razorpay_payment_id\":\"$pid\",\"razorpay_signature\":\"$sig\"}}" $B/orders
+}
+
 # --- patient: login, order, book appointment ---
 PT=$(curl -s $J -d '{"email":"priya@gmail.com","password":"patient123"}' $B/login | jget '["token"]')
 assert_eq "${#PT}" "48" "patient login returns token"
@@ -24,17 +38,20 @@ assert_eq "${#PT}" "48" "patient login returns token"
 BAD=$(curl -s $J -d '{"email":"priya@gmail.com","password":"wrong"}' $B/login | jget '["error"]')
 assert_eq "$BAD" "Invalid email or password" "wrong password rejected"
 
-ORDER=$(curl -s $J -H "Authorization: Bearer $PT" \
-  -d '{"items":[{"medicine_id":1,"qty":2}],"type":"delivery","address":"Test Lane"}' $B/orders)
-assert_eq "$(echo "$ORDER" | jget '["status"]')" "pending" "order placed"
+NOPAY=$(curl -s $J -H "Authorization: Bearer $PT" \
+  -d '{"items":[{"medicine_id":1,"qty":1}],"type":"pickup"}' $B/orders | jget '["error"]')
+assert_eq "$NOPAY" "Payment required" "order without payment rejected"
+
+ORDER=$(pay_and_order "$PT" '[{"medicine_id":1,"qty":2}]' '"type":"delivery","address":"Test Lane"')
+assert_eq "$(echo "$ORDER" | jget '["status"]')" "pending" "order placed after payment verified"
 OID=$(echo "$ORDER" | jget '["id"]')
 
 STOCK=$(curl -s "$B/medicines?search=Paracetamol" | jget '[0]["stock"]')
 assert_eq "$STOCK" "198" "stock decremented after order"
 
 OVERSELL=$(curl -s $J -H "Authorization: Bearer $PT" \
-  -d '{"items":[{"medicine_id":1,"qty":9999}],"type":"pickup"}' $B/orders | jget '["error"][:4]')
-assert_eq "$OVERSELL" "Only" "overselling blocked"
+  -d '{"items":[{"medicine_id":1,"qty":9999}]}' $B/payments/create | jget '["error"][:4]')
+assert_eq "$OVERSELL" "Only" "overselling blocked at payment"
 
 APPT=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"doctor_id":2,"slot":"2026-07-15 · Mon 10:00"}' $B/appointments)
 AID=$(echo "$APPT" | jget '["id"]')
@@ -110,6 +127,41 @@ assert_eq "$DDOC" "True" "doctor uploads verification documents"
 
 PTDOC=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"documents":{"x":"y"}}' $B/me/documents | jget '["error"]')
 assert_eq "$PTDOC" "Not allowed for your role" "patient blocked from document upload"
+
+# ============ Phase 3: payments, consultation, refills ============
+
+# --- payment signature verification ---
+PC=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"items":[{"medicine_id":5,"qty":1}]}' $B/payments/create)
+POID=$(echo "$PC" | jget '["providerOrderId"]')
+assert_eq "${POID:0:6}" "order_" "payment intent created with provider order id"
+
+BADSIG=$(curl -s $J -H "Authorization: Bearer $PT" \
+  -d "{\"items\":[{\"medicine_id\":5,\"qty\":1}],\"type\":\"pickup\",\"payment\":{\"razorpay_order_id\":\"$POID\",\"razorpay_payment_id\":\"pay_x\",\"razorpay_signature\":\"deadbeef\"}}" $B/orders | jget '["error"]')
+assert_eq "$BADSIG" "Payment signature verification failed" "tampered payment signature rejected"
+
+# --- teleconsultation chat (AID is a confirmed/completed appointment between PT and DR) ---
+MSG=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"body":"Hello doctor"}' $B/appointments/$AID/messages | jget '["body"]')
+assert_eq "$MSG" "Hello doctor" "patient sends consultation message"
+
+curl -s $J -H "Authorization: Bearer $DR" -d '{"body":"Take rest"}' $B/appointments/$AID/messages >/dev/null
+MSGS=$(curl -s -H "Authorization: Bearer $DR" $B/appointments/$AID/messages | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")
+assert_eq "$MSGS" "2" "both parties see the consultation thread"
+
+OTHER=$(curl -s $J -d "{\"email\":\"$NEWMAIL\",\"password\":\"secret1\"}" $B/login | jget '["token"]')
+DENY=$(curl -s -H "Authorization: Bearer $OTHER" $B/appointments/$AID/messages | jget '["error"]')
+assert_eq "$DENY" "Appointment not found" "non-party blocked from consultation thread"
+
+# --- video room ---
+ROOM=$(curl -s -H "Authorization: Bearer $PT" $B/appointments/$AID/room | jget '["url"][:21]')
+assert_eq "$ROOM" "https://meet.jit.si/e" "jitsi video room url issued"
+
+# --- refill reminders (REFILL_DAYS=0 so the reminder is immediately due) ---
+REFILLS=$(curl -s -H "Authorization: Bearer $PT" $B/refills | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")
+assert_eq "$REFILLS" "1" "refill reminder created for ordered medicine"
+
+curl -s -H "Authorization: Bearer $PT" $B/notifications >/dev/null  # triggers due-refill materialisation
+REFILLNOTE=$(curl -s -H "Authorization: Bearer $PT" $B/notifications | python3 -c "import sys,json;print(any('Refill reminder' in n['message'] for n in json.load(sys.stdin)))")
+assert_eq "$REFILLNOTE" "True" "due refill reminder surfaces as a notification"
 
 echo ""
 echo "ALL TESTS PASSED"

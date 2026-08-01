@@ -24,8 +24,9 @@ Delete the `epharma.db*` files to reset to a fresh seed.
 npm test
 ```
 
-End-to-end API suite (26 assertions): full patient → pharmacy → doctor → admin workflow,
-OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases.
+End-to-end API suite (35 assertions): full patient → pharmacy → doctor → admin workflow,
+OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
+payment signature verification, teleconsultation chat, and refill reminders.
 Uses a throwaway database — never touches demo data.
 See [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
 for the analysis document and development plan, and
@@ -43,16 +44,17 @@ for the analysis document and development plan, and
 ## Demo script (suggested flow)
 
 1. **Landing page** — search medicines/doctors without logging in.
-2. **Patient** (priya@gmail.com): browse medicines → add to cart → checkout with optional
-   prescription image → book a doctor appointment from the Doctors tab.
+2. **Patient** (priya@gmail.com): browse medicines → add to cart → checkout via the
+   Razorpay (sandbox) payment step → book a doctor appointment from the Doctors tab.
 3. **Pharmacy** (store@medplus.com): see the new order notification → advance it
    (pending → preparing → shipped → delivered) → manage inventory (add/edit/delete, low-stock warning).
-4. **Doctor** (asha@epharma.com): accept the appointment → write an e-prescription
-   (marks consultation completed) → check Earnings tab.
-5. **Patient again**: notifications for order status + prescription; view the e-prescription.
-6. **Register** a new doctor or pharmacy → shows "awaiting approval" state.
-7. **Admin** (admin@epharma.com): Overview stats → approve the pending registration →
-   monitor all orders and appointments.
+4. **Doctor** (asha@epharma.com): accept the appointment → open **Consult** (chat + video) →
+   write an e-prescription (marks consultation completed) → check Earnings tab.
+5. **Patient again**: reply in the consultation chat / join the video call; see order + prescription
+   notifications; check the **Refills** tab for the scheduled reorder reminder.
+6. **Register** a new doctor or pharmacy (upload verification documents) → shows "awaiting approval".
+7. **Admin** (admin@epharma.com): Overview stats → review documents → approve the pending
+   registration → monitor all orders and appointments.
 
 ## Features implemented (per project workflow doc)
 
@@ -81,7 +83,27 @@ for the analysis document and development plan, and
   non-negative numeric checks on every write endpoint, with clear error messages.
 - **Error handling** — malformed JSON, oversized uploads and unknown API routes now return clean JSON errors.
 
+### Phase 3 additions (commerce & consultation)
+
+- **Payments** — Razorpay-shaped checkout: a payment intent is created for the cart, then the order is
+  placed only after the server verifies the HMAC-SHA256 payment signature and that the paid amount
+  matches the recomputed cart total. Ships with a built-in mock provider (fully testable); going live
+  is a config change (`RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`) — see [payments.js](payments.js).
+- **Teleconsultation** — per-appointment chat (backed by the `messages` table, live-polled in the UI)
+  and a deterministic, unguessable Jitsi video room per appointment. Opens once the appointment is confirmed;
+  only the two parties can access it.
+- **Refill reminders** — every ordered medicine schedules a refill reminder (`REFILL_DAYS`, default 30);
+  due reminders surface automatically as patient notifications and in the **Refills** tab.
+
 ## API overview
+
+| Area | Endpoints |
+|---|---|
+| Payments | `POST /api/payments/create` (patient — payment intent for the cart) |
+| Consultation | `GET/POST /api/appointments/:id/messages`, `GET /api/appointments/:id/room` (patient/doctor party only) |
+| Refills | `GET /api/refills` (patient) |
+
+### Full endpoint reference
 
 | Area | Endpoints |
 |---|---|
@@ -96,7 +118,10 @@ for the analysis document and development plan, and
 
 ## Deliberate simplifications (current scope)
 
-- Payment gateway and chat/video consultation are stubbed/demo-only — swap in real providers
-  (Razorpay/Stripe, WebRTC) in Phase 3. OTP delivery is demo-mode until an SMS/email gateway is wired.
+- **Payments** run on a built-in mock provider; the signature-verification flow is production-identical,
+  so going live is just setting real Razorpay keys.
+- **Video** uses public `meet.jit.si` (no custom WebRTC signaling/TURN server this phase); **chat** live-updates
+  by polling (SSE/WebSocket is the production upgrade).
+- **OTP** delivery is demo-mode (code returned/logged) until an SMS/email gateway is wired.
 - Prescription and document images stored as data URLs in SQLite — move to file/object storage if sizes grow.
 - Single-process SQLite — fine for demo/dev; migrate to Postgres/MySQL for production ERP scale (Phase 5).

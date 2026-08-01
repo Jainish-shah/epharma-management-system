@@ -94,6 +94,35 @@ CREATE TABLE IF NOT EXISTS otps (
   code TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Phase 3: payment intents (Razorpay-shaped). One row per checkout attempt; linked to an order once paid.
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_order_id TEXT NOT NULL UNIQUE,
+  patient_id INTEGER NOT NULL REFERENCES users(id),
+  amount INTEGER NOT NULL,            -- in paise, Razorpay convention
+  status TEXT NOT NULL DEFAULT 'created' CHECK (status IN ('created','paid','failed')),
+  order_id INTEGER REFERENCES orders(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Phase 3: teleconsultation chat messages, scoped to a confirmed appointment.
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  appointment_id INTEGER NOT NULL REFERENCES appointments(id),
+  sender_id INTEGER NOT NULL REFERENCES users(id),
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Phase 3: refill reminders, one per ordered medicine, materialised into notifications when due.
+CREATE TABLE IF NOT EXISTS refill_reminders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patient_id INTEGER NOT NULL REFERENCES users(id),
+  medicine_name TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  notified INTEGER NOT NULL DEFAULT 0
+);
 `);
 
 // Phase 2 migration: add verification-documents column to existing databases (JSON of {label: dataURL}).

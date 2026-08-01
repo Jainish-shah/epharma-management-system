@@ -2,9 +2,11 @@ const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
 const { db, hashPassword, verifyPassword } = require('./db');
+const payments = require('./payments');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const REFILL_DAYS = Number(process.env.REFILL_DAYS || 30); // days after an order to remind for a refill
 
 app.use(express.json({ limit: '3mb' })); // prescriptions upload as base64 data URLs
 app.use(express.static(path.join(__dirname, 'public')));
@@ -27,6 +29,19 @@ const notify = (userId, message) =>
 
 const notifyAdmins = (message) => {
   for (const a of db.prepare("SELECT id FROM users WHERE role = 'admin'").all()) notify(a.id, message);
+};
+
+// Phase 3: turn any due, un-notified refill reminders into notifications. Checked on-access
+// (when the patient fetches notifications) so no background scheduler is needed for the demo.
+// NOTE: a production system would run this from a cron/worker, not lazily per request.
+const runDueRefills = (patientId) => {
+  const due = db
+    .prepare("SELECT * FROM refill_reminders WHERE patient_id = ? AND notified = 0 AND due_date <= datetime('now')")
+    .all(patientId);
+  for (const r of due) {
+    notify(patientId, `Refill reminder: it may be time to reorder ${r.medicine_name}`);
+    db.prepare('UPDATE refill_reminders SET notified = 1 WHERE id = ?').run(r.id);
+  }
 };
 
 // auth middleware: auth() = any logged-in user, auth('doctor','admin') = role-restricted
@@ -199,13 +214,63 @@ app.get('/api/my-medicines', auth('pharmacy'), (req, res) => {
   res.json(db.prepare('SELECT * FROM medicines WHERE pharmacy_id = ? ORDER BY name').all(req.user.id));
 });
 
+// ---------- payments (Phase 3) ----------
+
+// Price a cart without touching stock: returns { total, pharmacyId } or throws on a bad cart.
+function priceCart(items) {
+  if (!Array.isArray(items) || items.length === 0) throw new Error('Cart is empty');
+  let total = 0;
+  let pharmacyId = null;
+  for (const it of items) {
+    const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(it.medicine_id);
+    if (!med) throw new Error('Medicine not found');
+    if (pharmacyId && pharmacyId !== med.pharmacy_id) throw new Error('All items must be from one pharmacy');
+    pharmacyId = med.pharmacy_id;
+    const qty = Math.max(1, Number(it.qty) || 1);
+    if (med.stock < qty) throw new Error(`Only ${med.stock} left of ${med.name}`);
+    total += med.price * qty;
+  }
+  return { total, pharmacyId };
+}
+
+// Step 1 of checkout: create a payment intent for the cart. Returns the provider order id + amount.
+// On the mock gateway it also returns `demoCheckout` (the {order_id, payment_id, signature} triple a
+// real Razorpay widget would hand back) so the flow completes without live keys.
+app.post('/api/payments/create', auth('patient'), (req, res) => {
+  try {
+    const { total } = priceCart(req.body.items);
+    const amount = Math.round(total * 100); // paise
+    const providerOrder = payments.createOrder(amount);
+    db.prepare('INSERT INTO payments (provider_order_id, patient_id, amount) VALUES (?, ?, ?)')
+      .run(providerOrder.id, req.user.id, amount);
+    res.json({
+      providerOrderId: providerOrder.id,
+      amount,
+      currency: 'INR',
+      key: providerOrder.key,
+      demoCheckout: payments.IS_MOCK ? payments.mockCheckout(providerOrder.id) : undefined,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // ---------- orders ----------
 const NEXT_STATUS = { pending: 'preparing', preparing: null, shipped: 'delivered', ready: 'picked_up' };
 
 app.post('/api/orders', auth('patient'), (req, res) => {
-  const { items, type, address, prescription } = req.body;
+  const { items, type, address, prescription, payment } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
   if (type === 'delivery' && !address) return res.status(400).json({ error: 'Delivery address is required' });
+
+  // Phase 3: verify the payment before creating the order.
+  if (!payment || !payment.razorpay_order_id) return res.status(402).json({ error: 'Payment required' });
+  const pay = db.prepare('SELECT * FROM payments WHERE provider_order_id = ? AND patient_id = ?')
+    .get(payment.razorpay_order_id, req.user.id);
+  if (!pay || pay.status !== 'created') return res.status(402).json({ error: 'Unknown or already-used payment' });
+  if (!payments.verify(payment.razorpay_order_id, payment.razorpay_payment_id, payment.razorpay_signature)) {
+    return res.status(402).json({ error: 'Payment signature verification failed' });
+  }
 
   // node:sqlite has no transaction helper — manual BEGIN/COMMIT
   const placeOrder = () => {
@@ -224,6 +289,9 @@ app.post('/api/orders', auth('patient'), (req, res) => {
       lines.push({ med, qty });
     }
 
+    // Guard against tampering: paid amount must match the recomputed cart total.
+    if (Math.round(total * 100) !== pay.amount) throw new Error('Paid amount does not match cart total');
+
     let prescriptionId = null;
     if (prescription) {
       prescriptionId = db
@@ -237,8 +305,14 @@ app.post('/api/orders', auth('patient'), (req, res) => {
       .lastInsertRowid;
 
     const insertItem = db.prepare('INSERT INTO order_items (order_id, medicine_id, name, price, qty) VALUES (?, ?, ?, ?, ?)');
-    for (const { med, qty } of lines) insertItem.run(orderId, med.id, med.name, med.price, qty);
+    const insertRefill = db.prepare(
+      "INSERT INTO refill_reminders (patient_id, medicine_name, due_date) VALUES (?, ?, datetime('now', ?))");
+    for (const { med, qty } of lines) {
+      insertItem.run(orderId, med.id, med.name, med.price, qty);
+      insertRefill.run(req.user.id, med.name, `+${REFILL_DAYS} days`); // Phase 3: schedule refill reminder
+    }
 
+    db.prepare("UPDATE payments SET status = 'paid', order_id = ? WHERE id = ?").run(orderId, pay.id);
     notify(pharmacyId, `New order #${orderId} received (₹${total.toFixed(2)})`);
     return orderId;
   };
@@ -328,6 +402,62 @@ app.patch('/api/appointments/:id', auth('doctor'), (req, res) => {
   res.json(db.prepare('SELECT * FROM appointments WHERE id = ?').get(appt.id));
 });
 
+// ---------- teleconsultation: chat + video (Phase 3) ----------
+
+// Return the appointment only if this user is a party to it (its patient or its doctor).
+function apptForUser(id, user) {
+  const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id);
+  if (!appt) return null;
+  if (user.role === 'patient' && appt.patient_id === user.id) return appt;
+  if (user.role === 'doctor' && appt.doctor_id === user.id) return appt;
+  return null;
+}
+
+const CONSULT_SECRET = process.env.CONSULT_SECRET || 'epharma-consult-secret';
+
+app.get('/api/appointments/:id/messages', auth('patient', 'doctor'), (req, res) => {
+  const appt = apptForUser(req.params.id, req.user);
+  if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+  res.json(
+    db.prepare(`SELECT m.*, u.name AS sender_name, u.role AS sender_role FROM messages m
+      JOIN users u ON u.id = m.sender_id WHERE m.appointment_id = ? ORDER BY m.id`).all(appt.id)
+  );
+});
+
+app.post('/api/appointments/:id/messages', auth('patient', 'doctor'), (req, res) => {
+  const appt = apptForUser(req.params.id, req.user);
+  if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+  if (!['confirmed', 'completed'].includes(appt.status)) {
+    return res.status(400).json({ error: 'Consultation opens once the appointment is confirmed' });
+  }
+  if (!nonEmpty(req.body.body)) return res.status(400).json({ error: 'Message cannot be empty' });
+  const info = db.prepare('INSERT INTO messages (appointment_id, sender_id, body) VALUES (?, ?, ?)')
+    .run(appt.id, req.user.id, req.body.body.trim());
+  const other = req.user.id === appt.patient_id ? appt.doctor_id : appt.patient_id;
+  notify(other, `New consultation message from ${req.user.name}`);
+  res.json(db.prepare('SELECT * FROM messages WHERE id = ?').get(info.lastInsertRowid));
+});
+
+// Video room: a deterministic, unguessable Jitsi room per appointment (both parties derive the same name).
+// NOTE: uses public meet.jit.si — no custom WebRTC signaling/TURN server for this phase.
+app.get('/api/appointments/:id/room', auth('patient', 'doctor'), (req, res) => {
+  const appt = apptForUser(req.params.id, req.user);
+  if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+  if (!['confirmed', 'completed'].includes(appt.status)) {
+    return res.status(400).json({ error: 'Video call opens once the appointment is confirmed' });
+  }
+  const tokenPart = crypto.createHash('sha256').update(CONSULT_SECRET + ':' + appt.id).digest('hex').slice(0, 12);
+  const room = `epharma-appt-${appt.id}-${tokenPart}`;
+  res.json({ room, url: `https://meet.jit.si/${room}` });
+});
+
+// ---------- refill reminders (Phase 3) ----------
+app.get('/api/refills', auth('patient'), (req, res) => {
+  res.json(
+    db.prepare('SELECT * FROM refill_reminders WHERE patient_id = ? ORDER BY due_date').all(req.user.id)
+  );
+});
+
 // ---------- prescriptions ----------
 app.post('/api/prescriptions', auth('doctor'), (req, res) => {
   const { appointment_id, content } = req.body;
@@ -366,6 +496,7 @@ app.get('/api/prescriptions', auth(), (req, res) => {
 
 // ---------- notifications ----------
 app.get('/api/notifications', auth(), (req, res) => {
+  if (req.user.role === 'patient') runDueRefills(req.user.id); // Phase 3: surface any due refill reminders
   res.json(db.prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30').all(req.user.id));
 });
 

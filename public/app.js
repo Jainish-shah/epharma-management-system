@@ -39,7 +39,11 @@ async function api(path, opts = {}) {
 function openModal(html) {
   $('#modalRoot').innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal">${html}</div></div>`;
 }
-function closeModal() { $('#modalRoot').innerHTML = ''; }
+function closeModal() {
+  $('#modalRoot').innerHTML = '';
+  if (consultTimer) { clearInterval(consultTimer); consultTimer = null; } // stop chat polling
+  consultCurrent = null;
+}
 
 // ---------- navbar ----------
 async function renderNav() {
@@ -260,7 +264,7 @@ function requireLogin(action) {
 
 // ---------- shared dashboard scaffolding ----------
 const TABS = {
-  patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions'],
+  patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions', 'Refills'],
   doctor: ['Appointments', 'My Prescriptions', 'Earnings', 'Profile'],
   pharmacy: ['Inventory', 'Orders'],
   admin: ['Overview', 'Approvals', 'Users', 'Orders', 'Appointments'],
@@ -297,7 +301,7 @@ async function renderTab() {
       'Medicines': tabMedicines, 'Doctors': tabDoctors, 'My Orders': tabOrders, 'My Appointments': tabAppointments,
       'Prescriptions': tabPrescriptions, 'Appointments': tabAppointments, 'My Prescriptions': tabPrescriptions,
       'Earnings': tabEarnings, 'Profile': tabProfile, 'Inventory': tabInventory, 'Orders': tabOrders,
-      'Overview': tabOverview, 'Approvals': tabApprovals, 'Users': tabUsers,
+      'Overview': tabOverview, 'Approvals': tabApprovals, 'Users': tabUsers, 'Refills': tabRefills,
     };
     await renderers[activeTab](el);
   } catch (e) {
@@ -366,9 +370,10 @@ function showCart() {
     <input id="orderAddress" value="${esc(user.address || '')}" placeholder="Full address" />
     <label>Attach prescription (optional, image)</label>
     <input id="orderRx" type="file" accept="image/*" />
+    <div class="meta" style="margin-top:10px">🔒 Payments via Razorpay (sandbox)</div>
     <div class="actions">
       <button class="btn secondary" onclick="closeModal()">Keep shopping</button>
-      <button class="btn" onclick="placeOrder()">Pay ${money(total)} (demo)</button>
+      <button class="btn" onclick="placeOrder()">Pay ${money(total)}</button>
     </div>`);
 }
 
@@ -386,21 +391,37 @@ async function placeOrder() {
   try {
     const file = $('#orderRx').files[0];
     if (file && file.size > 2 * 1024 * 1024) throw new Error('Prescription image must be under 2 MB');
+    const items = cart.map((c) => ({ medicine_id: c.medicine_id, qty: c.qty }));
+
+    // Phase 3: two-step checkout — create a payment intent, then place the paid order.
+    // The demo/sandbox gateway returns `demoCheckout` (what Razorpay's widget would hand back);
+    // with real keys you'd open Razorpay Checkout here and use its response instead.
+    const intent = await api('/api/payments/create', { method: 'POST', body: { items } });
+    const payment = intent.demoCheckout || (await openRazorpay(intent));
+    toast('Payment successful ✓');
+
     const order = await api('/api/orders', {
       method: 'POST',
       body: {
-        items: cart.map((c) => ({ medicine_id: c.medicine_id, qty: c.qty })),
+        items,
         type: $('#orderType').value,
         address: $('#orderAddress').value.trim(),
         prescription: file ? await fileToDataUrl(file) : null,
+        payment,
       },
     });
     cart = [];
     closeModal();
     renderCartFab();
-    toast(`Order #${order.id} placed! Payment received (demo).`);
+    toast(`Order #${order.id} placed & paid ✓`);
     switchTab('My Orders');
   } catch (e) { toast(e.message, true); }
+}
+
+// Placeholder for real Razorpay Checkout — only reached when live keys are configured (no demoCheckout).
+// NOTE: load https://checkout.razorpay.com/v1/checkout.js and resolve with the handler response.
+function openRazorpay(intent) {
+  return Promise.reject(new Error('Live Razorpay keys configured but checkout.js is not loaded in this build'));
 }
 
 // ---------- patient: doctors + booking ----------
@@ -505,26 +526,108 @@ function viewRx(orderId) {
 async function tabAppointments(el) {
   const appts = await api('/api/appointments');
   if (!appts.length) return (el.innerHTML = '<div class="empty">No appointments yet</div>');
+  const showActions = user.role === 'doctor' || user.role === 'patient';
   el.innerHTML = `<div class="table-wrap"><table>
-    <tr><th>#</th><th>${user.role === 'doctor' ? 'Patient' : 'Doctor'}</th><th>Slot</th><th>Status</th>${user.role === 'doctor' ? '<th>Actions</th>' : ''}</tr>
+    <tr><th>#</th><th>${user.role === 'doctor' ? 'Patient' : 'Doctor'}</th><th>Slot</th><th>Status</th>${showActions ? '<th>Actions</th>' : ''}</tr>
     ${appts.map((a) => `
       <tr>
         <td>${a.id}</td>
         <td>${esc(user.role === 'doctor' ? a.patient_name : `${a.doctor_name} (${a.specialization})`)}</td>
         <td>${esc(a.slot)}</td>
         <td><span class="pill ${a.status}">${a.status}</span></td>
-        ${user.role === 'doctor' ? `<td>${doctorApptActions(a)}</td>` : ''}
+        ${showActions ? `<td>${user.role === 'doctor' ? doctorApptActions(a) : patientApptActions(a)}</td>` : ''}
       </tr>`).join('')}
   </table></div>`;
 }
+
+// Consultation (chat + video) opens once an appointment is confirmed (Phase 3).
+const consultBtn = (a) => ['confirmed', 'completed'].includes(a.status)
+  ? `<button class="btn secondary small" onclick="openConsult(${a.id})">💬 Consult</button>` : '';
+
+function patientApptActions(a) { return consultBtn(a) || '—'; }
 
 function doctorApptActions(a) {
   if (a.status === 'pending')
     return `<button class="btn small" onclick="setAppt(${a.id},'confirmed')">Accept</button>
       <button class="btn danger small" onclick="setAppt(${a.id},'rejected')">Reject</button>`;
   if (a.status === 'confirmed')
-    return `<button class="btn small" onclick="showWriteRx(${a.id})">Write e-prescription</button>`;
-  return '—';
+    return `${consultBtn(a)} <button class="btn small" onclick="showWriteRx(${a.id})">Write e-prescription</button>`;
+  return consultBtn(a) || '—';
+}
+
+// ---------- teleconsultation chat + video (Phase 3) ----------
+let consultCurrent = null;
+let consultTimer = null;
+
+async function openConsult(apptId) {
+  consultCurrent = apptId;
+  openModal(`
+    <h2>Teleconsultation</h2>
+    <div class="sub">Appointment #${apptId} · secure chat &amp; video</div>
+    <div id="chatBox" style="height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px;font-size:13px;background:var(--bg)">
+      <div class="meta">Loading…</div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <input id="chatInput" placeholder="Type a message…" onkeydown="if(event.key==='Enter')sendConsult()" autofocus />
+      <button class="btn" onclick="sendConsult()">Send</button>
+    </div>
+    <div class="actions">
+      <button class="btn secondary" onclick="joinVideo(${apptId})">🎥 Join video call</button>
+      <button class="btn secondary" onclick="closeModal()">Close</button>
+    </div>`);
+  await loadConsult();
+  consultTimer = setInterval(loadConsult, 3000); // simple poll; SSE/WebSocket is the production upgrade
+}
+
+async function loadConsult() {
+  if (!consultCurrent) return;
+  try {
+    const msgs = await api(`/api/appointments/${consultCurrent}/messages`);
+    const box = $('#chatBox');
+    if (!box) return;
+    box.innerHTML = msgs.length
+      ? msgs.map((m) => `<div style="margin-bottom:8px">
+          <b style="color:${m.sender_id === user.id ? 'var(--primary-dark)' : 'var(--text)'}">${esc(m.sender_name)}</b>
+          <span class="meta" style="font-size:11px"> · ${esc(m.created_at)}</span><br>${esc(m.body)}</div>`).join('')
+      : '<div class="meta">No messages yet — say hello 👋</div>';
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { /* modal likely closed */ }
+}
+
+async function sendConsult() {
+  const input = $('#chatInput');
+  if (!input) return;
+  const body = input.value.trim();
+  if (!body) return;
+  input.value = '';
+  try {
+    await api(`/api/appointments/${consultCurrent}/messages`, { method: 'POST', body: { body } });
+    await loadConsult();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function joinVideo(apptId) {
+  try {
+    const { url } = await api(`/api/appointments/${apptId}/room`);
+    window.open(url, '_blank');
+    toast('Opening secure video room…');
+  } catch (e) { toast(e.message, true); }
+}
+
+// ---------- refill reminders (Phase 3) ----------
+async function tabRefills(el) {
+  const refills = await api('/api/refills');
+  if (!refills.length) return (el.innerHTML = '<div class="empty">No refill reminders yet — they are scheduled automatically after you order medicines.</div>');
+  const today = new Date().toISOString().slice(0, 10);
+  el.innerHTML = `<div class="table-wrap"><table>
+    <tr><th>Medicine</th><th>Next refill due</th><th>Status</th></tr>
+    ${refills.map((r) => {
+      const due = r.due_date.slice(0, 10);
+      const isDue = due <= today;
+      return `<tr><td>${esc(r.medicine_name)}</td><td>${esc(due)}</td>
+        <td><span class="pill ${isDue ? 'pending' : 'confirmed'}">${isDue ? 'Due now' : 'Upcoming'}</span></td></tr>`;
+    }).join('')}
+  </table></div>`;
 }
 
 async function setAppt(id, status) {
