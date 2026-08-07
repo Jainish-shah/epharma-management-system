@@ -24,10 +24,10 @@ Delete the `epharma.db*` files to reset to a fresh seed.
 npm test
 ```
 
-End-to-end API suite (35 assertions): full patient → pharmacy → doctor → admin workflow,
+End-to-end API suite (45 assertions): full patient → pharmacy → doctor → admin workflow,
 OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
-payment signature verification, teleconsultation chat, and refill reminders.
-Uses a throwaway database — never touches demo data.
+payment signature verification, teleconsultation chat, refill reminders, admin reports,
+taxonomy management, and CMS editing. Uses a throwaway database — never touches demo data.
 See [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
 for the analysis document and development plan, and
 [docs/coding-standards.md](docs/coding-standards.md) for the project coding standards.
@@ -99,6 +99,17 @@ for the analysis document and development plan, and
 - **Refill reminders** — every ordered medicine schedules a refill reminder (`REFILL_DAYS`, default 30);
   due reminders surface automatically as patient notifications and in the **Refills** tab.
 
+### Phase 4 additions (admin ERP & reporting)
+
+- **Reports** — admin dashboard aggregations (revenue by day, top medicines, revenue by pharmacy,
+  order/appointment status breakdowns, consultation totals), rendered as CSS bar charts (no charting library).
+- **SMS / email gateway** — a second consumer on the Kafka `notifications` topic delivers every notification
+  over email/SMS (fan-out alongside DB persistence). Mock logs by default; set `NOTIFY_CHANNELS=email,sms`
+  and wire Twilio/SES to go live.
+- **Catalog management** — admin-managed medicine categories & doctor specialties (`taxonomy` table),
+  surfaced as `<datalist>` suggestions in the medicine and registration forms (advisory — free text still allowed).
+- **CMS pages** — admin-editable FAQ / Terms / Privacy (`cms_pages`), shown as links in the landing footer.
+
 ## API overview
 
 | Area | Endpoints |
@@ -107,6 +118,9 @@ for the analysis document and development plan, and
 | Consultation | `GET/POST /api/appointments/:id/messages`, `GET /api/appointments/:id/room` (patient/doctor party only) |
 | Refills | `GET /api/refills` (patient) |
 | Config (public) | `GET /api/config` (active payment provider) |
+| Reports | `GET /api/admin/reports` (admin) |
+| Catalog | `GET /api/taxonomy?type=`, `POST/DELETE /api/admin/taxonomy[/:id]` (admin write) |
+| CMS | `GET /api/cms`, `GET /api/cms/:slug`, `PUT /api/admin/cms/:slug` (admin write) |
 
 ### Full endpoint reference
 
@@ -132,6 +146,7 @@ All optional — the app runs with sensible defaults and no configuration.
 | `STRIPE_SECRET_KEY` / `STRIPE_PUBLISHABLE_KEY` | mock | live Stripe keys (else mock provider) |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | mock | live Razorpay keys (else mock provider) |
 | `KAFKA_BROKERS` | _(unset)_ | e.g. `localhost:9092` — stream events through Kafka instead of the in-process bus |
+| `NOTIFY_CHANNELS` | `log` | notification delivery channels: `log`, `email`, `sms` (comma-separated) |
 | `REFILL_DAYS` | `30` | days after an order before a refill reminder is due |
 
 **Run with real Kafka:**

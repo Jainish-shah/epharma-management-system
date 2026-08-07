@@ -52,6 +52,18 @@ subscribe(TOPICS.ORDERS, ({ orderId, pharmacyId, total }) => {
   console.log(`[orders] order #${orderId} placed with pharmacy ${pharmacyId} (₹${total.toFixed(2)})`);
 });
 
+// Phase 4: notification delivery gateway — a SECOND consumer on the notifications topic that
+// delivers the message over email/SMS (fan-out: one event is both persisted and delivered).
+// ponytail: mock delivery = log line. Set NOTIFY_CHANNELS=email,sms and swap the send bodies for
+// Twilio/AWS SES to go live — no other code changes.
+const NOTIFY_CHANNELS = (process.env.NOTIFY_CHANNELS || 'log').split(',');
+subscribe(TOPICS.NOTIFICATIONS, ({ userId, message }) => {
+  const u = db.prepare('SELECT email, phone FROM users WHERE id = ?').get(userId);
+  if (!u) return;
+  if (NOTIFY_CHANNELS.some((c) => c === 'email' || c === 'log')) console.log(`[email -> ${u.email}] ${message}`);
+  if (u.phone && NOTIFY_CHANNELS.some((c) => c === 'sms' || c === 'log')) console.log(`[sms -> ${u.phone}] ${message}`);
+});
+
 // Phase 3: turn any due, un-notified refill reminders into notifications. Checked on-access
 // (when the patient fetches notifications) so no background scheduler is needed for the demo.
 // NOTE: a production system would run this from a cron/worker, not lazily per request.
@@ -88,6 +100,22 @@ function issueToken(userId) {
 // ---------- public config ----------
 // Lets the client show the active payment provider without hard-coding it.
 app.get('/api/config', (req, res) => res.json({ paymentProvider: payments.provider, mock: payments.IS_MOCK }));
+
+// Phase 4: controlled lists (categories / specialties) — public read for form suggestions.
+app.get('/api/taxonomy', (req, res) => {
+  const rows = req.query.type
+    ? db.prepare('SELECT * FROM taxonomy WHERE type = ? ORDER BY name').all(req.query.type)
+    : db.prepare('SELECT * FROM taxonomy ORDER BY type, name').all();
+  res.json(rows);
+});
+
+// Phase 4: CMS pages — public read (list + single page).
+app.get('/api/cms', (req, res) => res.json(db.prepare('SELECT slug, title FROM cms_pages ORDER BY slug').all()));
+app.get('/api/cms/:slug', (req, res) => {
+  const page = db.prepare('SELECT * FROM cms_pages WHERE slug = ?').get(req.params.slug);
+  if (!page) return res.status(404).json({ error: 'Page not found' });
+  res.json(page);
+});
 
 // ---------- auth ----------
 
@@ -574,6 +602,44 @@ app.get('/api/admin/stats', auth('admin'), (req, res) => {
     revenue: db.prepare('SELECT COALESCE(SUM(total), 0) AS s FROM orders').get().s,
     appointments: count('SELECT COUNT(*) AS c FROM appointments'),
   });
+});
+
+// Phase 4: reporting — aggregation queries for the admin dashboard (revenue, orders, consultations).
+app.get('/api/admin/reports', auth('admin'), (req, res) => {
+  const all = (sql) => db.prepare(sql).all();
+  res.json({
+    revenue_by_day: all("SELECT substr(created_at,1,10) AS day, ROUND(SUM(total),2) AS revenue, COUNT(*) AS orders FROM orders GROUP BY day ORDER BY day"),
+    orders_by_status: all('SELECT status, COUNT(*) AS count FROM orders GROUP BY status'),
+    top_medicines: all('SELECT name, SUM(qty) AS units, ROUND(SUM(price*qty),2) AS revenue FROM order_items GROUP BY name ORDER BY units DESC LIMIT 5'),
+    revenue_by_pharmacy: all('SELECT u.store_name AS pharmacy, ROUND(SUM(o.total),2) AS revenue, COUNT(*) AS orders FROM orders o JOIN users u ON u.id=o.pharmacy_id GROUP BY o.pharmacy_id ORDER BY revenue DESC'),
+    appointments_by_status: all('SELECT status, COUNT(*) AS count FROM appointments GROUP BY status'),
+    consultations: db.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(d.fee),0) AS revenue FROM appointments a JOIN users d ON d.id=a.doctor_id WHERE a.status='completed'").get(),
+  });
+});
+
+// Phase 4: taxonomy management (admin add/remove categories & specialties).
+app.post('/api/admin/taxonomy', auth('admin'), (req, res) => {
+  const { type, name } = req.body;
+  if (!['category', 'specialty'].includes(type) || !nonEmpty(name)) {
+    return res.status(400).json({ error: 'A type (category/specialty) and name are required' });
+  }
+  db.prepare('INSERT OR IGNORE INTO taxonomy (type, name) VALUES (?, ?)').run(type, name.trim());
+  res.json(db.prepare('SELECT * FROM taxonomy WHERE type = ? AND name = ?').get(type, name.trim()));
+});
+
+app.delete('/api/admin/taxonomy/:id', auth('admin'), (req, res) => {
+  db.prepare('DELETE FROM taxonomy WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Phase 4: CMS editing (admin upsert of FAQ/Terms/Privacy pages).
+app.put('/api/admin/cms/:slug', auth('admin'), (req, res) => {
+  const { title, body } = req.body;
+  if (!nonEmpty(title) || !nonEmpty(body)) return res.status(400).json({ error: 'Title and body are required' });
+  db.prepare(`INSERT INTO cms_pages (slug, title, body, updated_at) VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(slug) DO UPDATE SET title = excluded.title, body = excluded.body, updated_at = excluded.updated_at`)
+    .run(req.params.slug, title.trim(), body);
+  res.json(db.prepare('SELECT * FROM cms_pages WHERE slug = ?').get(req.params.slug));
 });
 
 // ---------- error handling (Phase 2) ----------

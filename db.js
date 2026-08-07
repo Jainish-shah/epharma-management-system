@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS refill_reminders (
   due_date TEXT NOT NULL,
   notified INTEGER NOT NULL DEFAULT 0
 );
+
+-- Phase 4: admin-managed controlled lists (medicine categories, doctor specialties).
+-- Advisory only — forms use these as datalist suggestions; free-text is still accepted.
+CREATE TABLE IF NOT EXISTS taxonomy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL CHECK (type IN ('category','specialty')),
+  name TEXT NOT NULL,
+  UNIQUE(type, name)
+);
+
+-- Phase 4: admin-editable CMS pages (FAQs, Terms, Privacy).
+CREATE TABLE IF NOT EXISTS cms_pages (
+  slug TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 // Phase 2 migration: add verification-documents column to existing databases (JSON of {label: dataURL}).
@@ -222,6 +239,19 @@ if (db.prepare('SELECT COUNT(*) AS c FROM users').get().c === 0) {
     ['ORS Sachets (pack of 5)', 'Hydration', 40, 250],
   ];
   for (const m of meds) insertMed.run(medplus, ...m);
+
+  // Phase 4 seed: taxonomy (categories from the seeded medicines + doctor specialties) and CMS pages.
+  const insertTax = db.prepare('INSERT OR IGNORE INTO taxonomy (type, name) VALUES (?, ?)');
+  for (const c of [...new Set(meds.map((m) => m[1]))]) insertTax.run('category', c);
+  for (const s of ['Cardiology', 'Dermatology', 'Orthopedics', 'General Physician', 'Pediatrics']) insertTax.run('specialty', s);
+
+  const insertCms = db.prepare('INSERT OR IGNORE INTO cms_pages (slug, title, body) VALUES (?, ?, ?)');
+  insertCms.run('faq', 'Frequently Asked Questions',
+    'Q: How do I order medicines?\nBrowse or search, add to cart, and check out with a prescription if required.\n\nQ: How do consultations work?\nBook a doctor, and once confirmed you can chat or start a video call.\n\nQ: Are my prescriptions private?\nYes — they are visible only to you and the pharmacy or doctor involved in your order.');
+  insertCms.run('terms', 'Terms of Service',
+    'By using E-Pharma you agree to provide accurate information, use the platform lawfully, and follow prescription requirements for regulated medicines. Orders and consultations are subject to pharmacy and doctor availability.');
+  insertCms.run('privacy', 'Privacy Policy',
+    'We store your account details, orders, prescriptions and consultation records to provide the service. Access is role-based; medical records are shared only with the parties involved in your care. You may request deletion of your data.');
 }
 
 module.exports = { db, hashPassword, verifyPassword };

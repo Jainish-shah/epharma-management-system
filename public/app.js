@@ -118,7 +118,7 @@ function showRegister(role = 'patient') {
       </div>
       <div class="meta" id="otpHint" style="margin-top:4px"></div>`,
     doctor: `<label>Qualification</label><input id="regQualification" placeholder="MBBS, MD" />
-      <label>Specialization</label><input id="regSpecialization" placeholder="Cardiology" />
+      <label>Specialization</label><input id="regSpecialization" list="specList" placeholder="Cardiology" /><datalist id="specList"></datalist>
       <label>Consultation fee (₹)</label><input id="regFee" type="number" placeholder="500" />
       <label>Availability slots (comma separated)</label><input id="regAvailability" placeholder="Mon 10:00, Wed 15:00" />
       <label>Upload degree certificate (image)</label><input id="docDegree" type="file" accept="image/*" />
@@ -147,6 +147,7 @@ function showRegister(role = 'patient') {
       <button class="btn secondary" onclick="closeModal()">Cancel</button>
       <button class="btn" onclick="doRegister()">Register</button>
     </div>`);
+  if (role === 'doctor') fillDatalist('specList', 'specialty'); // Phase 4: managed specialty suggestions
 }
 
 async function sendOtp() {
@@ -256,7 +257,25 @@ async function renderLanding(search = '') {
               <button class="btn small" onclick="requireLogin('book appointments')">Book</button></div>
           </div>`).join('') || '<div class="empty">No doctors found</div>'}
       </div>
-    </div>`;
+    </div>
+    <footer style="text-align:center;padding:24px;border-top:1px solid var(--border);color:var(--muted);font-size:13px" id="cmsFooter"></footer>`;
+  renderCmsFooter();
+}
+
+// Phase 4: CMS page links in the landing footer + a read-only viewer modal.
+async function renderCmsFooter() {
+  try {
+    const pages = await api('/api/cms');
+    const el = $('#cmsFooter');
+    if (el) el.innerHTML = 'E-Pharma · ' + pages.map((p) => `<a href="#" onclick="viewCms('${p.slug}');return false" style="color:var(--primary-dark);margin:0 8px">${esc(p.title)}</a>`).join('·');
+  } catch (e) {}
+}
+
+async function viewCms(slug) {
+  const p = await api('/api/cms/' + slug);
+  openModal(`<h2>${esc(p.title)}</h2>
+    <div style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:60vh;overflow-y:auto">${esc(p.body)}</div>
+    <div class="actions"><button class="btn secondary" onclick="closeModal()">Close</button></div>`);
 }
 
 function requireLogin(action) {
@@ -268,7 +287,7 @@ const TABS = {
   patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions', 'Refills'],
   doctor: ['Appointments', 'My Prescriptions', 'Earnings', 'Profile'],
   pharmacy: ['Inventory', 'Orders'],
-  admin: ['Overview', 'Approvals', 'Users', 'Orders', 'Appointments'],
+  admin: ['Overview', 'Reports', 'Approvals', 'Users', 'Orders', 'Appointments', 'Catalog', 'Content'],
 };
 
 function renderDashboard() {
@@ -303,6 +322,7 @@ async function renderTab() {
       'Prescriptions': tabPrescriptions, 'Appointments': tabAppointments, 'My Prescriptions': tabPrescriptions,
       'Earnings': tabEarnings, 'Profile': tabProfile, 'Inventory': tabInventory, 'Orders': tabOrders,
       'Overview': tabOverview, 'Approvals': tabApprovals, 'Users': tabUsers, 'Refills': tabRefills,
+      'Reports': tabReports, 'Catalog': tabCatalog, 'Content': tabCms,
     };
     await renderers[activeTab](el);
   } catch (e) {
@@ -745,13 +765,24 @@ function showMedForm(m) {
   openModal(`
     <h2>${m ? 'Edit' : 'Add'} medicine</h2>
     <label>Name</label><input id="medName" value="${esc(m?.name || '')}" />
-    <label>Category</label><input id="medCategory" value="${esc(m?.category || '')}" placeholder="Pain Relief" />
+    <label>Category</label><input id="medCategory" list="catList" value="${esc(m?.category || '')}" placeholder="Pain Relief" />
+    <datalist id="catList"></datalist>
     <label>Price (₹)</label><input id="medPrice" type="number" step="0.01" value="${m?.price ?? ''}" />
     <label>Stock</label><input id="medStock" type="number" value="${m?.stock ?? ''}" />
     <div class="actions">
       <button class="btn secondary" onclick="closeModal()">Cancel</button>
       <button class="btn" onclick="saveMed(${m ? m.id : 'null'})">Save</button>
     </div>`);
+  fillDatalist('catList', 'category'); // Phase 4: suggest managed categories (free-text still allowed)
+}
+
+// Populate a <datalist> from the admin-managed taxonomy (advisory suggestions, non-blocking).
+async function fillDatalist(id, type) {
+  try {
+    const tax = await api('/api/taxonomy?type=' + type);
+    const dl = document.getElementById(id);
+    if (dl) dl.innerHTML = tax.map((t) => `<option value="${esc(t.name)}"></option>`).join('');
+  } catch (e) {}
 }
 
 async function saveMed(id) {
@@ -836,6 +867,91 @@ async function tabUsers(el) {
       <tr><td>${u.id}</td><td>${u.role}</td><td>${esc(u.name)}</td><td>${esc(u.email)}</td>
       <td>${esc(u.phone || '—')}</td><td><span class="pill ${u.status}">${u.status}</span></td></tr>`).join('')}
   </table></div>`;
+}
+
+// ---------- admin: reports (Phase 4) — CSS bar charts, no charting library ----------
+const barRow = (label, value, max, suffix = '') => {
+  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+  return `<div style="display:flex;align-items:center;gap:10px;margin:6px 0;font-size:13px">
+    <div style="width:150px;flex-shrink:0">${esc(label)}</div>
+    <div style="flex:1;background:var(--bg);border-radius:6px;overflow:hidden">
+      <div style="width:${pct}%;min-width:2px;background:var(--primary);color:#fff;padding:3px 8px;border-radius:6px;white-space:nowrap">${esc(String(value))}${suffix}</div>
+    </div></div>`;
+};
+
+async function tabReports(el) {
+  const r = await api('/api/admin/reports');
+  const maxRev = Math.max(1, ...r.revenue_by_day.map((d) => d.revenue));
+  const maxMed = Math.max(1, ...r.top_medicines.map((m) => m.units));
+  const maxPh = Math.max(1, ...r.revenue_by_pharmacy.map((p) => p.revenue));
+  const section = (title, rows) => `<div class="card" style="margin-bottom:16px"><h3>${title}</h3>${rows || '<div class="empty">No data yet</div>'}</div>`;
+  el.innerHTML = `
+    ${section('Revenue by day', r.revenue_by_day.map((d) => barRow(d.day, d.revenue, maxRev, ` (${d.orders} orders)`)).join(''))}
+    ${section('Top medicines (units sold)', r.top_medicines.map((m) => barRow(m.name, m.units, maxMed, ` · ${money(m.revenue)}`)).join(''))}
+    ${section('Revenue by pharmacy', r.revenue_by_pharmacy.map((p) => barRow(p.pharmacy, p.revenue, maxPh, ` (${p.orders})`)).join(''))}
+    <div class="stats">
+      <div class="stat"><div class="num">${r.consultations.total}</div><div class="label">Completed consultations</div></div>
+      <div class="stat"><div class="num">${money(r.consultations.revenue)}</div><div class="label">Consultation revenue</div></div>
+      ${r.orders_by_status.map((s) => `<div class="stat"><div class="num">${s.count}</div><div class="label">Orders: ${esc(s.status)}</div></div>`).join('')}
+    </div>`;
+}
+
+// ---------- admin: catalog (Phase 4) — manage categories & specialties ----------
+async function tabCatalog(el) {
+  const tax = await api('/api/taxonomy');
+  const group = (type, title) => {
+    const items = tax.filter((t) => t.type === type);
+    return `<div class="card" style="margin-bottom:16px">
+      <h3>${title}</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:10px 0">
+        ${items.map((t) => `<span class="badge-role" style="display:inline-flex;align-items:center;gap:6px">${esc(t.name)}
+          <button onclick="delTaxonomy(${t.id})" style="border:none;background:none;cursor:pointer;color:var(--danger);font-weight:700">✕</button></span>`).join('') || '<span class="meta">None yet</span>'}
+      </div>
+      <div style="display:flex;gap:8px;max-width:360px">
+        <input id="tax_${type}" placeholder="Add ${type}…" onkeydown="if(event.key==='Enter')addTaxonomy('${type}')" />
+        <button class="btn small" onclick="addTaxonomy('${type}')">Add</button>
+      </div>
+    </div>`;
+  };
+  el.innerHTML = group('category', 'Medicine categories') + group('specialty', 'Doctor specialties');
+}
+
+async function addTaxonomy(type) {
+  const input = $(`#tax_${type}`);
+  const name = input.value.trim();
+  if (!name) return;
+  try {
+    await api('/api/admin/taxonomy', { method: 'POST', body: { type, name } });
+    renderTab();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function delTaxonomy(id) {
+  await api(`/api/admin/taxonomy/${id}`, { method: 'DELETE' });
+  renderTab();
+}
+
+// ---------- admin: CMS content (Phase 4) ----------
+async function tabCms(el) {
+  const pages = await api('/api/cms');
+  const full = await Promise.all(pages.map((p) => api('/api/cms/' + p.slug)));
+  el.innerHTML = full.map((p) => `
+    <div class="card" style="margin-bottom:16px">
+      <label>Title</label><input id="cms_title_${p.slug}" value="${esc(p.title)}" />
+      <label>Body</label><textarea id="cms_body_${p.slug}" rows="6">${esc(p.body)}</textarea>
+      <div class="row" style="justify-content:space-between">
+        <span class="meta">/${esc(p.slug)} · updated ${esc(p.updated_at)}</span>
+        <button class="btn small" onclick="saveCms('${p.slug}')">Save</button>
+      </div>
+    </div>`).join('');
+}
+
+async function saveCms(slug) {
+  try {
+    await api('/api/admin/cms/' + slug, { method: 'PUT', body: { title: $(`#cms_title_${slug}`).value, body: $(`#cms_body_${slug}`).value } });
+    toast('Page saved');
+    renderTab();
+  } catch (e) { toast(e.message, true); }
 }
 
 // ---------- boot ----------

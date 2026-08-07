@@ -175,5 +175,28 @@ curl -s -H "Authorization: Bearer $PT" $B/notifications >/dev/null  # triggers d
 REFILLNOTE=$(curl -s -H "Authorization: Bearer $PT" $B/notifications | python3 -c "import sys,json;print(any('Refill reminder' in n['message'] for n in json.load(sys.stdin)))")
 assert_eq "$REFILLNOTE" "True" "due refill reminder surfaces as a notification"
 
+# ============ Phase 4: reporting, taxonomy, CMS ============
+
+REP=$(curl -s -H "Authorization: Bearer $AD" $B/admin/reports)
+assert_eq "$(echo "$REP" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("revenue_by_day" in d and "top_medicines" in d)')" "True" "admin reports returns aggregates"
+assert_eq "$(echo "$REP" | jget '["top_medicines"][0]["name"][:11]')" "Paracetamol" "reports rank top medicine by units"
+
+CATS=$(curl -s "$B/taxonomy?type=category" | python3 -c 'import sys,json;print(len(json.load(sys.stdin))>0)')
+assert_eq "$CATS" "True" "taxonomy seeds categories"
+
+curl -s $J -H "Authorization: Bearer $AD" -d '{"type":"specialty","name":"Neurology"}' $B/admin/taxonomy >/dev/null
+NEURO=$(curl -s "$B/taxonomy?type=specialty" | python3 -c "import sys,json;print(any(t['name']=='Neurology' for t in json.load(sys.stdin)))")
+assert_eq "$NEURO" "True" "admin adds a specialty to taxonomy"
+
+TAXDENY=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"type":"category","name":"X"}' $B/admin/taxonomy | jget '["error"]')
+assert_eq "$TAXDENY" "Not allowed for your role" "non-admin blocked from taxonomy"
+
+FAQ=$(curl -s $B/cms/faq | jget '["title"]')
+assert_eq "$FAQ" "Frequently Asked Questions" "public reads CMS page"
+
+curl -s -X PUT $J -H "Authorization: Bearer $AD" -d '{"title":"FAQ","body":"Updated body"}' $B/admin/cms/faq >/dev/null
+FAQ2=$(curl -s $B/cms/faq | jget '["body"]')
+assert_eq "$FAQ2" "Updated body" "admin edits CMS page"
+
 echo ""
 echo "ALL TESTS PASSED"
