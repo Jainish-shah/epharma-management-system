@@ -56,7 +56,7 @@
 ---
 
 ## If asked "what's tested?"
-`npm test` → 26 automated end-to-end assertions across all roles, including OTP, validation and RBAC denials.
+`bash test.sh` → 45 automated end-to-end assertions across all roles, including OTP, validation and RBAC denials.
 
 ## Demo accounts
 | Role | Email | Password |

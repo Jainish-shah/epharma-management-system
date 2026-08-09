@@ -3,25 +3,26 @@
 Integrated platform connecting patients, doctors and pharmacies — prescription-based ordering,
 teleconsultation booking, inventory management and admin oversight.
 
-**Stack:** Node.js + Express (REST API) · SQLite via built-in `node:sqlite` (zero config) · Vanilla JS SPA (no build step) · event streaming (in-process bus, optional Apache Kafka) · Stripe/Razorpay payments (sandbox)
+**Stack:** Python + Django (REST API) · SQLite via stdlib `sqlite3` · Vanilla JS SPA (no build step) · event streaming (in-process bus, optional Apache Kafka) · Stripe/Razorpay payments (sandbox)
 
 ## Run
 
-Requires Node.js ≥ 22.5 (uses the built-in SQLite module).
+Requires Python ≥ 3.11.
 
 ```bash
-npm install
-npm start
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python manage.py runserver 127.0.0.1:3000 --noreload
 # open http://localhost:3000
 ```
 
-The database (`epharma.db`) is created and seeded with demo data on first run.
-Delete the `epharma.db*` files to reset to a fresh seed.
+Django serves both the REST API (`/api/...`) and the SPA (`public/`). The database (`epharma.db`)
+is created and seeded with demo data on first run — delete the `epharma.db*` files to reset.
 
 ## Test
 
 ```bash
-npm test
+bash test.sh
 ```
 
 End-to-end API suite (45 assertions): full patient → pharmacy → doctor → admin workflow,

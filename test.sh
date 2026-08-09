@@ -10,10 +10,10 @@ export REFILL_DAYS=0   # refills immediately due, so the materialisation path is
 B="http://localhost:$PORT/api"
 J='-H Content-Type:application/json'
 
-node "$DIR/server.js" >/dev/null 2>&1 &
+"$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$PORT --noreload >/dev/null 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$(dirname "$EPHARMA_DB")"' EXIT
-for i in $(seq 1 20); do curl -s "$B/medicines" >/dev/null && break; sleep 0.25; done
+for i in $(seq 1 40); do curl -s "$B/medicines" >/dev/null && break; sleep 0.25; done
 
 jget() { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
 assert_eq() { [ "$1" = "$2" ] || { echo "FAIL: $3 (expected '$2', got '$1')"; exit 1; }; echo "ok: $3"; }
