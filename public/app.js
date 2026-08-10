@@ -1,18 +1,32 @@
-/* E-Pharma frontend — vanilla JS SPA, no build step */
+/* E-Pharma frontend — a single-page app in plain JavaScript (no framework, no build step).
+ *
+ * How it works:
+ *   - State lives in a few module-level variables below (token, user, cart, activeTab).
+ *   - Views are built by generating HTML strings and assigning them to `app.innerHTML`.
+ *   - `render()` decides what to show: the landing page when logged out, or the role's
+ *     dashboard (a set of tabs) when logged in.
+ *   - Every server call goes through the `api()` helper, which attaches the auth token.
+ *
+ * Roughly top-to-bottom: state/helpers -> auth (login/register) -> landing -> dashboard shell
+ * -> one function per tab (medicines, orders, appointments, admin, ...) -> boot at the very end.
+ */
 
-let token = localStorage.getItem('token');
-let user = JSON.parse(localStorage.getItem('user') || 'null');
-let cart = []; // { medicine_id, name, price, qty, store_name }
-let activeTab = null;
+// ---- app state (the whole SPA's memory) ----
+let token = localStorage.getItem('token');            // session token, sent as Authorization header
+let user = JSON.parse(localStorage.getItem('user') || 'null'); // signed-in user (null = logged out)
+let cart = []; // items the patient is buying: { medicine_id, name, price, qty, store_name }
+let activeTab = null;                                  // which dashboard tab is open
 let config = { paymentProvider: 'stripe', mock: true }; // filled from /api/config at boot
 
+// ---- tiny helpers used everywhere ----
 const $ = (sel) => document.querySelector(sel);
 const app = $('#app');
 
+// Escape user text before putting it in HTML — prevents XSS (someone's name breaking out into markup).
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const money = (n) => '₹' + Number(n).toFixed(2);
+const money = (n) => '₹' + Number(n).toFixed(2);  // format a number as ₹12.34
 
 function toast(msg, isError) {
   const t = $('#toast');
@@ -22,6 +36,8 @@ function toast(msg, isError) {
   t._timer = setTimeout(() => t.classList.add('hidden'), 3000);
 }
 
+// The single gateway to the backend: adds the auth token, sends/receives JSON, and turns any
+// error response into a thrown Error (so callers can `try/catch` and show a toast).
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     ...opts,
@@ -29,7 +45,7 @@ async function api(path, opts = {}) {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,  // objects are auto-serialised to JSON
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Something went wrong');
@@ -283,6 +299,8 @@ function requireLogin(action) {
 }
 
 // ---------- shared dashboard scaffolding ----------
+// Which tabs each role sees once logged in. The dashboard is just: a row of tab buttons + the
+// content of the active tab. Each tab name maps to a `tab*` render function (see `renderers` below).
 const TABS = {
   patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions', 'Refills'],
   doctor: ['Appointments', 'My Prescriptions', 'Earnings', 'Profile'],
@@ -290,9 +308,12 @@ const TABS = {
   admin: ['Overview', 'Reports', 'Approvals', 'Users', 'Orders', 'Appointments', 'Catalog', 'Content'],
 };
 
+// Draw the dashboard frame (tab bar + empty content area), then fill the active tab via renderTab().
 function renderDashboard() {
   const tabs = TABS[user.role];
-  if (!activeTab) activeTab = tabs[0];
+  if (!activeTab) activeTab = tabs[0];  // default to the first tab
+
+  // doctors/pharmacies can be logged in but not yet approved — show a status banner instead of tabs
 
   if (user.status === 'pending') {
     app.innerHTML = `<div class="container">
@@ -312,12 +333,15 @@ function renderDashboard() {
   renderTab();
 }
 
+// Clicking a tab button just records the choice and re-renders.
 function switchTab(t) { activeTab = t; renderDashboard(); }
 
+// Look up the render function for the active tab and run it. Any error (e.g. a failed API call)
+// is caught and shown in the content area instead of blanking the screen.
 async function renderTab() {
   const el = $('#tabContent');
   try {
-    const renderers = {
+    const renderers = {  // tab name -> the function that fills #tabContent for it
       'Medicines': tabMedicines, 'Doctors': tabDoctors, 'My Orders': tabOrders, 'My Appointments': tabAppointments,
       'Prescriptions': tabPrescriptions, 'Appointments': tabAppointments, 'My Prescriptions': tabPrescriptions,
       'Earnings': tabEarnings, 'Profile': tabProfile, 'Inventory': tabInventory, 'Orders': tabOrders,
@@ -955,13 +979,16 @@ async function saveCms(slug) {
 }
 
 // ---------- boot ----------
+// The one function that (re)draws the whole page. Called after login/logout and any state change:
+// redraws the navbar + cart button, then shows the dashboard if signed in, else the landing page.
 function render() {
   renderNav();
   renderCartFab();
-  document.querySelectorAll('.notif-panel').forEach((p) => p.remove());
+  document.querySelectorAll('.notif-panel').forEach((p) => p.remove());  // close any open notifications dropdown
   if (user) renderDashboard();
   else renderLanding();
 }
 
-// Load the active payment provider (Stripe/Razorpay) for the checkout label, then render.
+// Startup: fetch the active payment provider (for the checkout label), then do the first render.
+// `.finally(render)` means we render whether or not that call succeeds.
 api('/api/config').then((c) => { config = c; }).catch(() => {}).finally(render);

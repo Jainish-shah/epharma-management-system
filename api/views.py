@@ -1,7 +1,15 @@
-"""HTTP endpoints — Python/Django port of server.js. Same routes, same JSON shapes.
+"""HTTP endpoints — the whole REST API lives here (Python/Django port of the old server.js).
 
-Uses plain Django views (JsonResponse) + a token-auth helper; no DRF, mirroring the original
-hand-rolled backend so the frontend contract is byte-for-byte compatible.
+How a request flows:
+    browser  ->  epharma_site/urls.py  ->  api/urls.py  ->  a view function below  ->  JsonResponse
+
+Each view is a plain function that takes the Django `request`, does its work with the tiny
+`db` helper (raw SQL), and returns JSON via `J(...)`. There is no ORM and no DRF — the SQL and the
+JSON shapes are written out explicitly so the frontend contract is easy to follow.
+
+Two small conventions you'll see everywhere:
+  * `@api`  — wraps a view to parse the JSON body and turn any crash into a clean JSON error.
+  * `require_auth(request, *roles)` — checks the Bearer token and role; returns (user, error).
 """
 import json
 import mimetypes
@@ -14,17 +22,25 @@ from django.views.decorators.csrf import csrf_exempt
 
 from . import db, payments, events
 
-REFILL_DAYS = int(os.environ.get("REFILL_DAYS", "30"))
-NOTIFY_CHANNELS = os.environ.get("NOTIFY_CHANNELS", "log").split(",")
-CONSULT_SECRET = os.environ.get("CONSULT_SECRET", "epharma-consult-secret")
-NEXT_STATUS = {"pending": "preparing", "preparing": None, "shipped": "delivered", "ready": "picked_up"}
-PUBLIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public")
+# ---- configuration (all overridable by environment variables) ----
+REFILL_DAYS = int(os.environ.get("REFILL_DAYS", "30"))          # days after an order before a refill reminder is due
+NOTIFY_CHANNELS = os.environ.get("NOTIFY_CHANNELS", "log").split(",")  # where notifications are "delivered" (log/email/sms)
+CONSULT_SECRET = os.environ.get("CONSULT_SECRET", "epharma-consult-secret")  # salts the Jitsi video room name
+NEXT_STATUS = {"pending": "preparing", "preparing": None, "shipped": "delivered", "ready": "picked_up"}  # order pipeline
+PUBLIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public")  # the SPA files
 
 TOPICS = events.TOPICS
 
 
+def J(data, status=200):
+    """Return JSON. Also normalises whole floats (60.0 -> 60) so output matches the old JS backend."""
+    data = _num(data)
+    return JsonResponse(data, status=status, safe=not isinstance(data, list))
+
+
 def _num(x):
-    # Match JS JSON number formatting: SQLite REAL 60.0 -> 60 (JS prints integral floats without ".0").
+    # Python prints 60.0 where JS printed 60; SQLite REAL columns come back as floats. Convert
+    # integral floats to ints (recursively) so prices/totals read as "60" not "60.0" in the JSON.
     if isinstance(x, bool):
         return x
     if isinstance(x, float) and x.is_integer():
@@ -36,12 +52,7 @@ def _num(x):
     return x
 
 
-def J(data, status=200):
-    data = _num(data)
-    return JsonResponse(data, status=status, safe=not isinstance(data, list))
-
-
-# ---------- validation helpers ----------
+# ---------- validation helpers (used to reject bad input at the boundary) ----------
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _PHONE_RE = re.compile(r"^[0-9+\-\s]{7,15}$")
 
@@ -51,6 +62,7 @@ def is_email(s):
 
 
 def is_phone(s):
+    # phone is optional: empty/None is allowed, otherwise it must look like a phone number
     return s is None or s == "" or (isinstance(s, str) and bool(_PHONE_RE.match(s)))
 
 
@@ -68,10 +80,14 @@ def non_neg_num(n):
 
 
 def gen_otp():
+    """A random 6-digit code (100000–999999) for registration verification."""
     return str(secrets.randbelow(900000) + 100000)
 
 
 # ---------- notifications + event consumers ----------
+# Instead of writing to the DB directly, we PUBLISH a notification event. Several independent
+# "consumers" (registered just below) react to it: one saves it, another "delivers" it by email/SMS.
+# This is the event-driven design — producers don't know or care who consumes.
 def notify(user_id, message):
     events.publish(TOPICS["NOTIFICATIONS"], {"userId": user_id, "message": message})
 
@@ -81,12 +97,12 @@ def notify_admins(message):
         notify(a["id"], message)
 
 
-# Notification service: persist every notification event.
+# Consumer 1 — persistence: save every notification event as a row.
 events.subscribe(TOPICS["NOTIFICATIONS"], lambda e: db.run(
     "INSERT INTO notifications (user_id, message) VALUES (?, ?)", (e["userId"], e["message"])))
 
 
-# Payment service: issue the patient's receipt notification.
+# Consumer — payments: when a payment succeeds, send the patient a receipt notification.
 def _on_payment(e):
     print(f"[payments] order #{e['orderId']} paid: ₹{e['amount'] / 100:.2f}")
     notify(e["patientId"], f"Payment received: ₹{e['amount'] / 100:.2f} for order #{e['orderId']}")
@@ -94,13 +110,13 @@ def _on_payment(e):
 
 events.subscribe(TOPICS["PAYMENTS"], _on_payment)
 
-# Order/analytics service: a second consumer on the stream (fan-out).
+# Consumer — orders/analytics: a second consumer on the orders topic (shows fan-out; here just logs).
 events.subscribe(TOPICS["ORDERS"], lambda e: print(
     f"[orders] order #{e['orderId']} placed with pharmacy {e['pharmacyId']} (₹{e['total']:.2f})"))
 
 
-# Notification delivery gateway: a SECOND consumer on the notifications topic that delivers over
-# email/SMS. Mock = log line; set NOTIFY_CHANNELS=email,sms and swap in Twilio/SES to go live.
+# Consumer 2 on notifications — delivery gateway: "send" the message by email/SMS.
+# Mock = a log line. Set NOTIFY_CHANNELS=email,sms and drop in Twilio/SES here to go live.
 def _deliver(e):
     u = db.get("SELECT email, phone FROM users WHERE id = ?", (e["userId"],))
     if not u:
@@ -115,6 +131,8 @@ events.subscribe(TOPICS["NOTIFICATIONS"], _deliver)
 
 
 def run_due_refills(patient_id):
+    """Turn any refill reminders that have come due into real notifications (checked when the
+    patient opens their notifications, so no background scheduler is needed for the demo)."""
     due = db.query("SELECT * FROM refill_reminders WHERE patient_id = ? AND notified = 0 AND due_date <= datetime('now')",
                    (patient_id,))
     for r in due:
@@ -124,13 +142,15 @@ def run_due_refills(patient_id):
 
 # ---------- request plumbing ----------
 def body(request):
+    """Parse the JSON request body into a dict ({} if empty)."""
     if not request.body:
         return {}
-    return json.loads(request.body)  # raises json.JSONDecodeError -> handled by @api
+    return json.loads(request.body)  # raises json.JSONDecodeError -> handled by @api below
 
 
 def api(fn):
-    """Parse JSON body, normalise errors to JSON (mirrors the express error handler)."""
+    """Decorator applied to every view: parse the JSON body up front, and convert a bad body or an
+    unexpected exception into a clean JSON error (instead of Django's HTML error page)."""
     @csrf_exempt
     def wrapper(request, *a, **kw):
         try:
@@ -147,6 +167,9 @@ def api(fn):
 
 
 def require_auth(request, *roles):
+    """Look up the caller from their `Authorization: Bearer <token>` header.
+    Returns (user_dict, None) when allowed, or (None, error_response) to return immediately.
+    Pass role names to restrict (e.g. require_auth(request, 'admin')); no roles = any logged-in user."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     user = db.get("SELECT u.* FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token = ?", (token,))
     if not user:
@@ -156,14 +179,16 @@ def require_auth(request, *roles):
     return user, None
 
 
-# ---------- public config / taxonomy / cms ----------
+# ==================== public config / taxonomy / cms ====================
 @api
 def config(request):
+    """GET /api/config — public. Tells the frontend which payment provider is active."""
     return J({"paymentProvider": payments.provider, "mock": payments.IS_MOCK})
 
 
 @api
 def taxonomy(request):
+    """GET /api/taxonomy?type=category|specialty — public. Admin-managed lists used as form suggestions."""
     t = request.GET.get("type")
     rows = (db.query("SELECT * FROM taxonomy WHERE type = ? ORDER BY name", (t,)) if t
             else db.query("SELECT * FROM taxonomy ORDER BY type, name"))
@@ -172,24 +197,29 @@ def taxonomy(request):
 
 @api
 def cms_list(request):
+    """GET /api/cms — public. List of editable content pages (FAQ / Terms / Privacy)."""
     return J(db.query("SELECT slug, title FROM cms_pages ORDER BY slug"))
 
 
 @api
 def cms_page(request, slug):
+    """GET /api/cms/<slug> — public. Full content of one CMS page."""
     page = db.get("SELECT * FROM cms_pages WHERE slug = ?", (slug,))
     return J(page) if page else J({"error": "Page not found"}, 404)
 
 
-# ---------- auth ----------
+# ==================== auth & registration ====================
 @api
 def send_otp(request):
+    """POST /api/register/send-otp — public. Step 1 of patient sign-up: issue a 6-digit code.
+    Demo returns the code in the response (and logs it); a real build would SMS/email it instead."""
     email = request.data.get("email")
     if not is_email(email):
         return J({"error": "A valid email is required"}, 400)
     if db.get("SELECT id FROM users WHERE email = ?", (email,)):
         return J({"error": "Email already registered"}, 400)
     code = gen_otp()
+    # upsert: one live code per email (replaces any previous one)
     db.run("INSERT INTO otps (email, code, created_at) VALUES (?, ?, datetime('now')) "
            "ON CONFLICT(email) DO UPDATE SET code = excluded.code, created_at = excluded.created_at", (email, code))
     print(f"[OTP] {email} -> {code}")
@@ -198,7 +228,10 @@ def send_otp(request):
 
 @api
 def register(request):
+    """POST /api/register — public. Create a patient/doctor/pharmacy account.
+    Patients must pass a matching OTP; doctors & pharmacies start 'pending' for admin approval."""
     b = request.data
+    # --- validate every field before touching the database ---
     if b.get("role") not in ("patient", "doctor", "pharmacy"):
         return J({"error": "Invalid role"}, 400)
     if not non_empty(b.get("name")):
@@ -218,13 +251,14 @@ def register(request):
     if db.get("SELECT id FROM users WHERE email = ?", (b["email"],)):
         return J({"error": "Email already registered"}, 400)
 
+    # --- patients: verify the OTP issued by send-otp ---
     if b["role"] == "patient":
         row = db.get("SELECT code FROM otps WHERE email = ?", (b["email"],))
         if not row or row["code"] != str(b.get("otp") or ""):
             return J({"error": "Invalid or missing OTP — please verify your email/mobile first"}, 400)
 
-    status = "approved" if b["role"] == "patient" else "pending"
-    documents = json.dumps(b["documents"]) if isinstance(b.get("documents"), dict) else None
+    status = "approved" if b["role"] == "patient" else "pending"  # providers need admin approval
+    documents = json.dumps(b["documents"]) if isinstance(b.get("documents"), dict) else None  # verification files, if any
     uid = db.run(
         "INSERT INTO users (role, name, email, phone, password_hash, status, specialization, qualification, fee, "
         "availability, store_name, license_no, gstin, address, documents) "
@@ -233,15 +267,17 @@ def register(request):
          b.get("specialization") or None, b.get("qualification") or None, b.get("fee") or None,
          b.get("availability") or None, b.get("store_name") or None, b.get("license_no") or None,
          b.get("gstin") or None, b.get("address") or None, documents))
-    db.run("DELETE FROM otps WHERE email = ?", (b["email"],))
+    db.run("DELETE FROM otps WHERE email = ?", (b["email"],))  # OTP is single-use
     if status == "pending":
         notify_admins(f"New {b['role']} registration awaiting approval: {b['name']}")
     user = db.get("SELECT * FROM users WHERE id = ?", (uid,))
+    # hand back a session token so the new user is logged in immediately
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
 
 @api
 def me_documents(request):
+    """POST /api/me/documents — doctor/pharmacy. Upload/replace verification documents for review."""
     user, err = require_auth(request, "doctor", "pharmacy")
     if err:
         return err
@@ -255,15 +291,17 @@ def me_documents(request):
 
 @api
 def login(request):
+    """POST /api/login — public. Verify email+password, return a session token."""
     email = request.data.get("email") or ""
     user = db.get("SELECT * FROM users WHERE email = ?", (email,))
     if not user or not db.verify_password(request.data.get("password") or "", user["password_hash"]):
-        return J({"error": "Invalid email or password"}, 401)
+        return J({"error": "Invalid email or password"}, 401)  # same message for both cases (don't reveal which)
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
 
 @api
 def logout(request):
+    """POST /api/logout — any user. Delete the current token so it can't be reused."""
     user, err = require_auth(request)
     if err:
         return err
@@ -274,21 +312,24 @@ def logout(request):
 
 @api
 def me(request):
+    """GET /api/me — any user (return profile).  PATCH /api/me — update allowed profile fields."""
     user, err = require_auth(request)
     if err:
         return err
     if request.method == "PATCH":
         allowed = ["name", "phone", "address", "availability", "fee", "specialization", "qualification"]
-        for key in allowed:
+        for key in allowed:  # only whitelisted columns can be changed
             if key in request.data:
                 db.run(f"UPDATE users SET {key} = ? WHERE id = ?", (request.data[key], user["id"]))
         user = db.get("SELECT * FROM users WHERE id = ?", (user["id"],))
     return J(db.public_user(user))
 
 
-# ---------- catalog / inventory ----------
+# ==================== catalog & pharmacy inventory ====================
 @api
 def medicines(request):
+    """GET /api/medicines?search= — public catalog (approved pharmacies only).
+    POST /api/medicines — pharmacy adds a medicine to their own inventory."""
     if request.method == "POST":
         user, err = require_auth(request, "pharmacy")
         if err:
@@ -303,7 +344,7 @@ def medicines(request):
         mid = db.run("INSERT INTO medicines (pharmacy_id, name, category, price, stock) VALUES (?, ?, ?, ?, ?)",
                      (user["id"], b["name"], b["category"], float(b["price"]), int(float(b.get("stock") or 0))))
         return J(db.get("SELECT * FROM medicines WHERE id = ?", (mid,)))
-    search = f"%{request.GET.get('search', '')}%"
+    search = f"%{request.GET.get('search', '')}%"  # LIKE pattern; empty search matches everything
     return J(db.query(
         "SELECT m.*, u.store_name FROM medicines m JOIN users u ON u.id = m.pharmacy_id AND u.status = 'approved' "
         "WHERE m.name LIKE ? OR m.category LIKE ? ORDER BY m.name", (search, search)))
@@ -311,6 +352,7 @@ def medicines(request):
 
 @api
 def doctors(request):
+    """GET /api/doctors?search= — public. Approved doctors, searchable by name or specialty."""
     search = f"%{request.GET.get('search', '')}%"
     return J(db.query(
         "SELECT id, name, specialization, qualification, fee, availability FROM users "
@@ -320,6 +362,8 @@ def doctors(request):
 
 @api
 def medicine_detail(request, id):
+    """PATCH /api/medicines/<id> — edit.  DELETE /api/medicines/<id> — remove.
+    Pharmacy only, and only for medicines they own (the WHERE clause enforces ownership)."""
     user, err = require_auth(request, "pharmacy")
     if err:
         return err
@@ -329,7 +373,7 @@ def medicine_detail(request, id):
     if request.method == "DELETE":
         db.run("DELETE FROM medicines WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
         return J({"ok": True})
-    m = {**med, **request.data}
+    m = {**med, **request.data}  # start from the existing row, overlay any provided fields
     db.run("UPDATE medicines SET name = ?, category = ?, price = ?, stock = ? WHERE id = ?",
            (m["name"], m["category"], float(m["price"]), int(float(m["stock"])), med["id"]))
     return J(db.get("SELECT * FROM medicines WHERE id = ?", (med["id"],)))
@@ -337,14 +381,17 @@ def medicine_detail(request, id):
 
 @api
 def my_medicines(request):
+    """GET /api/my-medicines — pharmacy. The signed-in pharmacy's own inventory."""
     user, err = require_auth(request, "pharmacy")
     if err:
         return err
     return J(db.query("SELECT * FROM medicines WHERE pharmacy_id = ? ORDER BY name", (user["id"],)))
 
 
-# ---------- payments ----------
+# ==================== payments (checkout step 1) ====================
 def price_cart(items):
+    """Total up a cart WITHOUT changing stock; raises ValueError on any problem.
+    Used to size the payment before the order is actually placed."""
     if not isinstance(items, list) or not items:
         raise ValueError("Cart is empty")
     total, pharmacy_id = 0, None
@@ -353,7 +400,7 @@ def price_cart(items):
         if not med:
             raise ValueError("Medicine not found")
         if pharmacy_id and pharmacy_id != med["pharmacy_id"]:
-            raise ValueError("All items must be from one pharmacy")
+            raise ValueError("All items must be from one pharmacy")  # one order = one pharmacy
         pharmacy_id = med["pharmacy_id"]
         qty = max(1, int(it.get("qty") or 1))
         if med["stock"] < qty:
@@ -364,6 +411,9 @@ def price_cart(items):
 
 @api
 def payments_create(request):
+    """POST /api/payments/create — patient. Create a payment intent sized to the cart.
+    Returns the provider order id; on the mock gateway also returns `demoCheckout` (the signed
+    fields a real Stripe/Razorpay widget would hand back) so the demo can complete a payment."""
     user, err = require_auth(request, "patient")
     if err:
         return err
@@ -371,7 +421,7 @@ def payments_create(request):
         total, _ = price_cart(request.data.get("items"))
     except ValueError as e:
         return J({"error": str(e)}, 400)
-    amount = round(total * 100)
+    amount = round(total * 100)  # provider amounts are in the smallest unit (paise)
     intent = payments.create_intent(amount)
     db.run("INSERT INTO payments (provider_order_id, patient_id, amount) VALUES (?, ?, ?)",
            (intent["id"], user["id"], amount))
@@ -380,9 +430,11 @@ def payments_create(request):
               "demoCheckout": payments.mock_checkout(intent["id"]) if payments.IS_MOCK else None})
 
 
-# ---------- orders ----------
+# ==================== orders ====================
 @api
 def orders(request):
+    """GET /api/orders — list orders scoped to the caller's role (patient sees theirs, pharmacy
+    theirs, admin all).  POST /api/orders — place a paid order (see _create_order)."""
     if request.method == "POST":
         return _create_order(request)
     user, err = require_auth(request)
@@ -400,7 +452,7 @@ def orders(request):
         "SELECT o.*, p.name AS patient_name, ph.store_name FROM orders o "
         "JOIN users p ON p.id = o.patient_id JOIN users ph ON ph.id = o.pharmacy_id "
         f"{where} ORDER BY o.id DESC", params)
-    for o in rows:
+    for o in rows:  # attach line items + any prescription to each order
         o["items"] = db.query("SELECT * FROM order_items WHERE order_id = ?", (o["id"],))
         rx = db.get("SELECT content FROM prescriptions WHERE id = ?", (o["prescription_id"],)) if o["prescription_id"] else None
         o["prescription"] = rx["content"] if rx else None
@@ -408,6 +460,12 @@ def orders(request):
 
 
 def _create_order(request):
+    """Place an order — the app's most careful path. Steps:
+       1. verify the payment (must exist, be unused, and pass signature verification),
+       2. inside a DB transaction: re-check stock, decrement it, and create the order + items,
+       3. confirm the paid amount equals the freshly re-computed total (anti-tamper),
+       4. schedule refill reminders and emit order/payment events.
+    If anything fails the transaction rolls back, so stock is never left half-decremented."""
     user, err = require_auth(request, "patient")
     if err:
         return err
@@ -419,6 +477,7 @@ def _create_order(request):
     if otype == "delivery" and not address:
         return J({"error": "Delivery address is required"}, 400)
 
+    # --- step 1: payment must be present, ours, unused, and genuine ---
     provider_order_id = payments.order_id_of(payment) if payment else None
     if not provider_order_id:
         return J({"error": "Payment required"}, 402)
@@ -429,6 +488,7 @@ def _create_order(request):
         return J({"error": "Payment verification failed"}, 402)
 
     def place_order():
+        # steps 2 & 3 run inside the transaction below
         total, pharmacy_id, lines = 0, None, []
         for it in items:
             med = db.get("SELECT * FROM medicines WHERE id = ?", (it.get("medicine_id"),))
@@ -443,7 +503,7 @@ def _create_order(request):
             db.run("UPDATE medicines SET stock = stock - ? WHERE id = ?", (qty, med["id"]))
             total += med["price"] * qty
             lines.append((med, qty))
-        if round(total * 100) != pay["amount"]:
+        if round(total * 100) != pay["amount"]:  # anti-tamper: paid amount must match the cart
             raise ValueError("Paid amount does not match cart total")
         prescription_id = None
         if prescription:
@@ -456,16 +516,18 @@ def _create_order(request):
         for med, qty in lines:
             db.run("INSERT INTO order_items (order_id, medicine_id, name, price, qty) VALUES (?, ?, ?, ?, ?)",
                    (oid, med["id"], med["name"], med["price"], qty))
+            # schedule a refill reminder REFILL_DAYS from now for each medicine bought
             db.run("INSERT INTO refill_reminders (patient_id, medicine_name, due_date) VALUES (?, ?, datetime('now', ?))",
                    (user["id"], med["name"], f"+{REFILL_DAYS} days"))
         db.run("UPDATE payments SET status = 'paid', order_id = ? WHERE id = ?", (oid, pay["id"]))
+        # step 4: announce what happened; consumers turn these into logs, receipts, notifications
         events.publish(TOPICS["ORDERS"], {"orderId": oid, "pharmacyId": pharmacy_id, "patientId": user["id"], "total": total})
         events.publish(TOPICS["PAYMENTS"], {"orderId": oid, "patientId": user["id"], "amount": pay["amount"]})
         notify(pharmacy_id, f"New order #{oid} received (₹{total:.2f})")
         return oid
 
     try:
-        with db.transaction():
+        with db.transaction():  # commit on success, roll back on any raised error
             order_id = place_order()
         return J(db.get("SELECT * FROM orders WHERE id = ?", (order_id,)))
     except ValueError as e:
@@ -474,6 +536,8 @@ def _create_order(request):
 
 @api
 def order_detail(request, id):
+    """PATCH /api/orders/<id> — pharmacy advances the order one step along its pipeline
+    (pending -> preparing -> shipped/ready -> delivered/picked_up, branching on delivery vs pickup)."""
     user, err = require_auth(request, "pharmacy")
     if err:
         return err
@@ -481,7 +545,7 @@ def order_detail(request, id):
     if not order:
         return J({"error": "Order not found"}, 404)
     nxt = NEXT_STATUS.get(order["status"])
-    if order["status"] == "preparing":
+    if order["status"] == "preparing":  # the one branch: delivery ships, pickup becomes ready
         nxt = "shipped" if order["type"] == "delivery" else "ready"
     if not nxt:
         return J({"error": "Order is already complete"}, 400)
@@ -490,9 +554,11 @@ def order_detail(request, id):
     return J(db.get("SELECT * FROM orders WHERE id = ?", (order["id"],)))
 
 
-# ---------- appointments ----------
+# ==================== appointments ====================
 @api
 def appointments(request):
+    """GET /api/appointments — list (scoped to patient/doctor/admin).
+    POST /api/appointments — patient books a slot with a doctor (starts 'pending')."""
     if request.method == "POST":
         user, err = require_auth(request, "patient")
         if err:
@@ -526,6 +592,7 @@ def appointments(request):
 
 @api
 def appointment_detail(request, id):
+    """PATCH /api/appointments/<id> — doctor accepts/rejects/completes their own appointment."""
     user, err = require_auth(request, "doctor")
     if err:
         return err
@@ -541,6 +608,8 @@ def appointment_detail(request, id):
 
 
 def appt_for_user(id, user):
+    """Return the appointment only if this user is a party to it (its patient or its doctor);
+    otherwise None. This is the access check for the consultation chat/video below."""
     appt = db.get("SELECT * FROM appointments WHERE id = ?", (id,))
     if not appt:
         return None
@@ -551,14 +620,17 @@ def appt_for_user(id, user):
     return None
 
 
+# ==================== teleconsultation: chat + video ====================
 @api
 def appointment_messages(request, id):
+    """GET .../messages — read the consultation thread.  POST .../messages — send a message.
+    Only the two parties can access it, and only once the appointment is confirmed."""
     user, err = require_auth(request, "patient", "doctor")
     if err:
         return err
     appt = appt_for_user(id, user)
     if not appt:
-        return J({"error": "Appointment not found"}, 404)
+        return J({"error": "Appointment not found"}, 404)  # also the "you're not a party" response
     if request.method == "POST":
         if appt["status"] not in ("confirmed", "completed"):
             return J({"error": "Consultation opens once the appointment is confirmed"}, 400)
@@ -576,6 +648,8 @@ def appointment_messages(request, id):
 
 @api
 def appointment_room(request, id):
+    """GET /api/appointments/<id>/room — return a Jitsi video-room URL for this appointment.
+    The room name is derived from a secret + the id, so it's stable for both parties but not guessable."""
     user, err = require_auth(request, "patient", "doctor")
     if err:
         return err
@@ -590,9 +664,10 @@ def appointment_room(request, id):
     return J({"room": room, "url": f"https://meet.jit.si/{room}"})
 
 
-# ---------- refills / prescriptions ----------
+# ==================== refills & prescriptions ====================
 @api
 def refills(request):
+    """GET /api/refills — patient. Their scheduled refill reminders (soonest first)."""
     user, err = require_auth(request, "patient")
     if err:
         return err
@@ -601,6 +676,8 @@ def refills(request):
 
 @api
 def prescriptions(request):
+    """GET /api/prescriptions — patient sees theirs, doctor sees ones they wrote.
+    POST /api/prescriptions — doctor writes an e-prescription (also marks the appointment complete)."""
     if request.method == "POST":
         user, err = require_auth(request, "doctor")
         if err:
@@ -633,6 +710,7 @@ def prescriptions(request):
 
 @api
 def prescriptions_upload(request):
+    """POST /api/prescriptions/upload — patient uploads a prescription image (base64 data URL)."""
     user, err = require_auth(request, "patient")
     if err:
         return err
@@ -643,9 +721,11 @@ def prescriptions_upload(request):
     return J(db.get("SELECT * FROM prescriptions WHERE id = ?", (pid,)))
 
 
-# ---------- notifications / earnings ----------
+# ==================== notifications & earnings ====================
 @api
 def notifications(request):
+    """GET /api/notifications — latest 30 for the caller. For patients, first materialise any
+    refill reminders that have come due (so they show up here without a background job)."""
     user, err = require_auth(request)
     if err:
         return err
@@ -656,6 +736,7 @@ def notifications(request):
 
 @api
 def notifications_read(request):
+    """POST /api/notifications/read — mark all of the caller's notifications as read."""
     user, err = require_auth(request)
     if err:
         return err
@@ -665,6 +746,7 @@ def notifications_read(request):
 
 @api
 def earnings(request):
+    """GET /api/earnings — doctor. Completed-consultation count and total (count × fee)."""
     user, err = require_auth(request, "doctor")
     if err:
         return err
@@ -672,9 +754,10 @@ def earnings(request):
     return J({"consultations": row["consultations"], "total": row["consultations"] * (user["fee"] or 0)})
 
 
-# ---------- admin ----------
+# ==================== admin ====================
 @api
 def admin_users(request):
+    """GET /api/admin/users?status=&role= — admin. All non-admin users, optionally filtered."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -690,6 +773,7 @@ def admin_users(request):
 
 @api
 def admin_user_detail(request, id):
+    """PATCH /api/admin/users/<id> — admin approves or rejects a pending doctor/pharmacy."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -706,6 +790,7 @@ def admin_user_detail(request, id):
 
 @api
 def admin_stats(request):
+    """GET /api/admin/stats — admin. Headline KPI counts for the dashboard overview."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -726,6 +811,7 @@ def admin_stats(request):
 
 @api
 def admin_reports(request):
+    """GET /api/admin/reports — admin. Aggregation queries powering the Reports charts."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -741,6 +827,7 @@ def admin_reports(request):
 
 @api
 def admin_taxonomy(request):
+    """POST /api/admin/taxonomy — admin adds a category or specialty (ignored if it already exists)."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -753,6 +840,7 @@ def admin_taxonomy(request):
 
 @api
 def admin_taxonomy_detail(request, id):
+    """DELETE /api/admin/taxonomy/<id> — admin removes a category or specialty."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -762,6 +850,7 @@ def admin_taxonomy_detail(request, id):
 
 @api
 def admin_cms(request, slug):
+    """PUT /api/admin/cms/<slug> — admin creates or updates a CMS page (upsert on slug)."""
     user, err = require_auth(request, "admin")
     if err:
         return err
@@ -774,15 +863,17 @@ def admin_cms(request, slug):
     return J(db.get("SELECT * FROM cms_pages WHERE slug = ?", (slug,)))
 
 
-# ---------- fallthrough ----------
+# ==================== fallthrough: unknown API route + SPA files ====================
 @api
 def api_not_found(request, *a, **kw):
+    """Any /api/... path that matched nothing above -> JSON 404 (not Django's HTML page)."""
     return J({"error": "Endpoint not found"}, 404)
 
 
 @csrf_exempt
 def serve_public(request, path=""):
-    """Serve the SPA (public/) with an index.html fallback."""
+    """Serve the SPA from public/. Unknown paths fall back to index.html (single-page app routing).
+    The startswith check keeps requests from escaping the public/ directory (path-traversal guard)."""
     rel = path or "index.html"
     full = os.path.normpath(os.path.join(PUBLIC_DIR, rel))
     if not full.startswith(PUBLIC_DIR) or not os.path.isfile(full):

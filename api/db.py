@@ -20,24 +20,31 @@ _conn.execute("PRAGMA foreign_keys = ON")
 _lock = threading.RLock()  # serialise writes (dev server is threaded)
 
 
+# The four helpers below are the entire data layer. Every SQL value is bound with `?` (never
+# string-formatted in), which keeps the app safe from SQL injection.
+
 def query(sql, params=()):
+    """Run a SELECT and return ALL matching rows as a list of dicts."""
     with _lock:
         return [dict(r) for r in _conn.execute(sql, params).fetchall()]
 
 
 def get(sql, params=()):
+    """Run a SELECT and return the FIRST row as a dict (or None if there is none)."""
     with _lock:
         row = _conn.execute(sql, params).fetchone()
         return dict(row) if row else None
 
 
 def run(sql, params=()):
+    """Run an INSERT/UPDATE/DELETE and return the new row's id (lastrowid)."""
     with _lock:
         cur = _conn.execute(sql, params)
         return cur.lastrowid
 
 
 def execute(script):
+    """Run a multi-statement SQL script (used once to create the schema)."""
     with _lock:
         _conn.executescript(script)
 
@@ -46,6 +53,10 @@ def execute(script):
 import contextlib
 
 
+# Wrap a block of writes so they all succeed together or none do:
+#   with db.transaction():
+#       ... several db.run(...) calls ...
+# If the block raises, everything is rolled back (used by order placement so stock/order stay in sync).
 @contextlib.contextmanager
 def transaction():
     with _lock:
@@ -167,6 +178,8 @@ CREATE TABLE IF NOT EXISTS cms_pages (
 
 
 def init_and_seed():
+    """Create the tables (no-op if they already exist), then load demo data — but only on a fresh
+    database. The `count != 0` guard means an existing DB is left untouched, so restarts don't wipe data."""
     execute(SCHEMA)
     if get("SELECT COUNT(*) AS c FROM users")["c"] != 0:
         return
@@ -255,10 +268,12 @@ def init_and_seed():
 
 
 def issue_token(user_id):
+    """Create a fresh random session token for a user and store it (login/register call this)."""
     token = secrets.token_hex(24)
     run("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, user_id))
     return token
 
 
 def public_user(u):
+    """Strip the password hash before a user object is ever sent to the client."""
     return {k: v for k, v in u.items() if k != "password_hash"}
