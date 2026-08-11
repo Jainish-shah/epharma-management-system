@@ -51,7 +51,7 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 |---|---|
 | Single Django server serving both API and static frontend | One process, one port; simplest deployable unit for this scope |
 | Token-based auth (server-stored session tokens) | Stateless clients, instant revocation on logout |
-| SQLite via stdlib `sqlite3` (thin helper layer, not the ORM) | Zero-config, transactional, explicit SQL; clean migration path to PostgreSQL for production scale |
+| Dual-backend data layer: SQLite by default, PostgreSQL via `DATABASE_URL` (raw driver, not the ORM) | Zero-config for demos, production-grade database for deployment — one code path, verified by the same test suite on both |
 | Vanilla JS SPA, no build step | No toolchain risk; runs anywhere Python ≥ 3.11 serves it |
 | Role checks in one `require_auth(*roles)` helper | RBAC enforced at the view boundary, single point of audit |
 | Event bus abstraction (in-process default, Kafka opt-in) | Decouples producers (orders/payments) from consumers (notifications/receipts); scales to multiple instances via Kafka without changing business logic |
@@ -101,6 +101,7 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | `refill_reminders` | patient_id, medicine_name, due_date, notified | Materialised into notifications when due |
 | `taxonomy` | type (category/specialty), name | Admin-managed lists; advisory `<datalist>` suggestions |
 | `cms_pages` | slug, title, body | Admin-editable FAQ / Terms / Privacy |
+| `audit_log` | user_id, actor, action, detail | Security trail: logins, approvals, orders, prescriptions |
 
 ## 5. API Architecture
 
@@ -111,7 +112,9 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 - **RBAC** on every route via middleware; ownership checks on every mutation (pharmacy can only advance its own orders, doctor only its own appointments).
 - **Password hashing:** scrypt with per-user salt and timing-safe comparison.
 - **Server-side validation:** prices and totals computed from DB, stock checked transactionally, status transitions whitelisted.
-- **Roadmap for HIPAA/GDPR alignment:** encrypt prescription blobs at rest, audit logging, data-retention policy, consent capture at registration (Phase 5).
+- **Encryption at rest (Phase 5):** prescriptions, consultation messages and verification documents are encrypted with Fernet (AES-CBC + HMAC) before storage, so a stolen database contains ciphertext.
+- **Audit logging (Phase 5):** logins (including failed attempts), registrations, approvals, orders, prescriptions and CMS edits are recorded in `audit_log` and reviewable by admins.
+- **Remaining for full HIPAA/GDPR alignment:** data-retention policy, consent capture at registration, key rotation via a managed secrets store, and TLS termination in the deployment (Phase 6).
 
 ## 7. Development Plan (13 July – 17 September 2026)
 
@@ -121,13 +124,13 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 | 2. Core module hardening | 20 Jul – 2 Aug | OTP-verified patient registration, document upload for doctor & pharmacy verification, input-validation & error-handling pass, coding standards | ✅ Done (wk 1 of 2) |
 | 3. Commerce & consultation | 3–16 Aug | Payment-gateway integration (Razorpay sandbox, signature-verified), teleconsultation chat + Jitsi video, refill reminders | ✅ Done |
 | 4. Admin ERP & reporting | 17–30 Aug | Revenue/consultation/order reports, CMS pages, SMS/email gateway (Kafka consumer), category & specialty management | ✅ Done |
-| 5. Performance & security | 31 Aug – 13 Sep | PostgreSQL migration, encryption at rest, audit logs, load testing, accessibility pass | Planned |
+| 5. Performance & security | 31 Aug – 13 Sep | PostgreSQL support (dual-backend data layer), encryption at rest, audit logging, load testing, accessibility pass | ✅ Done |
 | 6. Deployment & handover | 14–17 Sep | Production deployment, final documentation, demo & handover | Planned |
 
 ## 8. Testing Strategy
 
-- **Now:** automated end-to-end API suite (`bash test.sh`) — 45 assertions covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, and CMS editing. Runs against a throwaway database.
-- **Later phases:** browser automation for critical UI flows, load test before deployment.
+- **Now:** automated end-to-end API suite (`bash test.sh`) — 49 assertions, passing on **both SQLite and PostgreSQL**, plus a load-test script (`bash loadtest.sh`). Covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, CMS editing, encryption-at-rest verification (asserts the raw database column is ciphertext) and the audit trail. Runs against a throwaway database.
+- **Later phases:** browser automation for critical UI flows; production smoke tests after deployment.
 
 ## 9. Risks & Mitigations
 

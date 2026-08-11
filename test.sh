@@ -198,5 +198,32 @@ curl -s -X PUT $J -H "Authorization: Bearer $AD" -d '{"title":"FAQ","body":"Upda
 FAQ2=$(curl -s $B/cms/faq | jget '["body"]')
 assert_eq "$FAQ2" "Updated body" "admin edits CMS page"
 
+# ============ Phase 5: encryption at rest, audit trail ============
+
+# The doctor wrote an e-prescription earlier ("Rx test"). API must return plaintext...
+RXTEXT=$(curl -s -H "Authorization: Bearer $PT" $B/prescriptions | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['content'])")
+assert_eq "$RXTEXT" "Rx test" "prescription decrypts to plaintext via the API"
+
+# ...but the raw database column must be ciphertext (encrypted at rest).
+RAW=$("$DIR/.venv/bin/python" -c "
+import os
+url = os.environ.get('DATABASE_URL')
+if url:
+    import psycopg
+    v = psycopg.connect(url, client_encoding='UTF8').execute('SELECT content FROM prescriptions ORDER BY id DESC LIMIT 1').fetchone()[0]
+else:
+    import sqlite3
+    v = sqlite3.connect(os.environ['EPHARMA_DB']).execute('SELECT content FROM prescriptions ORDER BY id DESC LIMIT 1').fetchone()[0]
+print('ENC' if v.startswith('enc:') and 'Rx test' not in v else 'PLAIN')
+")
+assert_eq "$RAW" "ENC" "prescription is encrypted at rest in the database"
+
+# audit trail records security-relevant actions and is admin-only
+AUD=$(curl -s -H "Authorization: Bearer $AD" $B/admin/audit | python3 -c "import sys,json;d=json.load(sys.stdin);print(any(a['action']=='order.placed' for a in d) and any(a['action']=='login' for a in d))")
+assert_eq "$AUD" "True" "audit log records login and order events"
+
+PTAUD=$(curl -s -H "Authorization: Bearer $PT" $B/admin/audit | jget '["error"]')
+assert_eq "$PTAUD" "Not allowed for your role" "non-admin blocked from the audit log"
+
 echo ""
 echo "ALL TESTS PASSED"

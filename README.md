@@ -111,6 +111,23 @@ for the analysis document and development plan, and
   surfaced as `<datalist>` suggestions in the medicine and registration forms (advisory — free text still allowed).
 - **CMS pages** — admin-editable FAQ / Terms / Privacy (`cms_pages`), shown as links in the landing footer.
 
+### Phase 5 additions (performance & security)
+
+- **PostgreSQL support** — set `DATABASE_URL=postgres://…` to run on PostgreSQL instead of SQLite.
+  One data layer serves both (placeholders, `RETURNING id`, schema types and transactions are
+  translated in [api/db.py](api/db.py)); the full test suite passes on **both** backends.
+- **Encryption at rest** — prescriptions, consultation messages and verification documents are
+  encrypted with Fernet (AES-CBC + HMAC) before they are stored and decrypted on the way out, so a
+  stolen database file contains ciphertext. Key from `EPHARMA_ENC_KEY` — see [api/crypto.py](api/crypto.py).
+- **Audit logging** — logins (including failures), registrations, approvals, orders, prescriptions
+  and CMS edits are written to an `audit_log` table; admins can review it at `GET /api/admin/audit`.
+- **Load testing** — `bash loadtest.sh [requests] [concurrency]` benchmarks the hot endpoints with
+  ApacheBench (local result: ~2.1–2.9k req/s, p95 ≤ 19 ms, 0 failures on SQLite).
+- **Accessibility pass** — skip link, keyboard focus rings (`:focus-visible`), ARIA labels on icon
+  buttons, `role="tablist"`/`aria-selected` on dashboard tabs, live regions for toasts and tab
+  content, `role="dialog"` + focus management + Escape-to-close on modals, `alt` text on all images,
+  and `prefers-reduced-motion` support.
+
 ## API overview
 
 | Area | Endpoints |
@@ -149,6 +166,8 @@ All optional — the app runs with sensible defaults and no configuration.
 | `KAFKA_BROKERS` | _(unset)_ | e.g. `localhost:9092` — stream events through Kafka instead of the in-process bus |
 | `NOTIFY_CHANNELS` | `log` | notification delivery channels: `log`, `email`, `sms` (comma-separated) |
 | `REFILL_DAYS` | `30` | days after an order before a refill reminder is due |
+| `DATABASE_URL` | _(unset)_ | `postgres://user:pass@host/db` — run on PostgreSQL instead of SQLite |
+| `EPHARMA_ENC_KEY` | demo key | secret used to encrypt medical records at rest — **set this in production** |
 
 **Run with real Kafka:**
 

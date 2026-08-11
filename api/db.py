@@ -1,8 +1,12 @@
-"""SQLite data layer — Python port of db.js (schema, seed, helpers).
+"""Data layer — works on SQLite (default, zero-config) OR PostgreSQL (Phase 5).
 
-Uses stdlib sqlite3 directly (not the Django ORM) so the exact SQL and JSON shapes from the
-original Node backend are preserved and the frontend needs no changes.
+Set DATABASE_URL=postgres://user:pass@host/db to run on PostgreSQL; otherwise a local SQLite file
+is used. The rest of the app calls the same four helpers (query/get/run/execute) either way — this
+module hides every dialect difference (placeholder style, RETURNING vs lastrowid, schema types).
+
+We deliberately use the raw driver (not the Django ORM) so the SQL and JSON shapes stay explicit.
 """
+import contextlib
 import hashlib
 import hmac
 import json
@@ -11,34 +15,64 @@ import secrets
 import sqlite3
 import threading
 
+from . import crypto  # encryption at rest for sensitive columns
+
 DB_PATH = os.environ.get("EPHARMA_DB") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "epharma.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+IS_PG = bool(DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")))  # else SQLite
 
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # autocommit; explicit BEGIN for txns
-_conn.row_factory = sqlite3.Row
-_conn.execute("PRAGMA journal_mode = WAL")
-_conn.execute("PRAGMA foreign_keys = ON")
-_lock = threading.RLock()  # serialise writes (dev server is threaded)
+if IS_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+    # client_encoding=UTF8 so Unicode content (₹, em-dashes, names) round-trips regardless of server locale
+    _conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row, client_encoding="UTF8")
+else:
+    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # autocommit; explicit BEGIN for txns
+    _conn.row_factory = sqlite3.Row
+    _conn.execute("PRAGMA journal_mode = WAL")
+    _conn.execute("PRAGMA foreign_keys = ON")
+_lock = threading.RLock()  # serialise access (dev server is threaded; one shared connection)
 
 
-# The four helpers below are the entire data layer. Every SQL value is bound with `?` (never
+def _sql(s):
+    # Call sites write SQLite-style `?` placeholders; psycopg wants `%s`. Translate for Postgres.
+    return s.replace("?", "%s") if IS_PG else s
+
+
+# The four helpers below are the entire data layer. Every SQL value is bound as a parameter (never
 # string-formatted in), which keeps the app safe from SQL injection.
 
 def query(sql, params=()):
     """Run a SELECT and return ALL matching rows as a list of dicts."""
     with _lock:
-        return [dict(r) for r in _conn.execute(sql, params).fetchall()]
+        rows = _conn.execute(_sql(sql), params).fetchall()
+        return rows if IS_PG else [dict(r) for r in rows]
 
 
 def get(sql, params=()):
     """Run a SELECT and return the FIRST row as a dict (or None if there is none)."""
     with _lock:
-        row = _conn.execute(sql, params).fetchone()
-        return dict(row) if row else None
+        row = _conn.execute(_sql(sql), params).fetchone()
+        if not row:
+            return None
+        return row if IS_PG else dict(row)
 
 
 def run(sql, params=()):
-    """Run an INSERT/UPDATE/DELETE and return the new row's id (lastrowid)."""
+    """Run an INSERT/UPDATE/DELETE and return the new row's id.
+    SQLite gives us lastrowid for free; Postgres has no lastrowid, so for plain inserts we append
+    `RETURNING id` and read it back (skipped for UPDATE/DELETE and for `ON CONFLICT` upserts)."""
     with _lock:
+        if IS_PG:
+            s = _sql(sql)
+            is_insert = s.lstrip().upper().startswith("INSERT") and "ON CONFLICT" not in s.upper()
+            if is_insert:
+                s = s.rstrip().rstrip(";") + " RETURNING id"
+            cur = _conn.execute(s, params)
+            if is_insert:
+                r = cur.fetchone()
+                return r["id"] if r else None
+            return None
         cur = _conn.execute(sql, params)
         return cur.lastrowid
 
@@ -46,11 +80,12 @@ def run(sql, params=()):
 def execute(script):
     """Run a multi-statement SQL script (used once to create the schema)."""
     with _lock:
-        _conn.executescript(script)
-
-
-# ---- transactions (mirror the node BEGIN/COMMIT/ROLLBACK order path) ----
-import contextlib
+        if IS_PG:
+            for stmt in script.split(";"):
+                if stmt.strip():
+                    _conn.execute(stmt)
+        else:
+            _conn.executescript(script)
 
 
 # Wrap a block of writes so they all succeed together or none do:
@@ -60,13 +95,17 @@ import contextlib
 @contextlib.contextmanager
 def transaction():
     with _lock:
-        _conn.execute("BEGIN")
-        try:
-            yield
-            _conn.execute("COMMIT")
-        except Exception:
-            _conn.execute("ROLLBACK")
-            raise
+        if IS_PG:
+            with _conn.transaction():
+                yield
+        else:
+            _conn.execute("BEGIN")
+            try:
+                yield
+                _conn.execute("COMMIT")
+            except Exception:
+                _conn.execute("ROLLBACK")
+                raise
 
 
 # ---- password hashing (scrypt, matches Node crypto.scryptSync defaults N=16384 r=8 p=1, keylen 64) ----
@@ -98,28 +137,16 @@ CREATE TABLE IF NOT EXISTS users (
   store_name TEXT, license_no TEXT, gstin TEXT, address TEXT, documents TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL REFERENCES users(id)
+);
 CREATE TABLE IF NOT EXISTS medicines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pharmacy_id INTEGER NOT NULL REFERENCES users(id),
   name TEXT NOT NULL, category TEXT NOT NULL, price REAL NOT NULL, stock INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS orders (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  patient_id INTEGER NOT NULL REFERENCES users(id),
-  pharmacy_id INTEGER NOT NULL REFERENCES users(id),
-  status TEXT NOT NULL DEFAULT 'pending',
-  type TEXT NOT NULL DEFAULT 'delivery' CHECK (type IN ('delivery','pickup')),
-  address TEXT, total REAL NOT NULL,
-  prescription_id INTEGER REFERENCES prescriptions(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS order_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  order_id INTEGER NOT NULL REFERENCES orders(id),
-  medicine_id INTEGER NOT NULL REFERENCES medicines(id),
-  name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL
-);
+-- Tables are declared in dependency order (a table's REFERENCES targets must already exist —
+-- SQLite tolerates forward references, PostgreSQL does not).
 CREATE TABLE IF NOT EXISTS appointments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   patient_id INTEGER NOT NULL REFERENCES users(id),
@@ -136,6 +163,22 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   kind TEXT NOT NULL CHECK (kind IN ('uploaded','eprescription')),
   content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patient_id INTEGER NOT NULL REFERENCES users(id),
+  pharmacy_id INTEGER NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'pending',
+  type TEXT NOT NULL DEFAULT 'delivery' CHECK (type IN ('delivery','pickup')),
+  address TEXT, total REAL NOT NULL,
+  prescription_id INTEGER REFERENCES prescriptions(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS order_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  medicine_id INTEGER NOT NULL REFERENCES medicines(id),
+  name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,13 +217,26 @@ CREATE TABLE IF NOT EXISTS cms_pages (
   slug TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Phase 5: security audit trail — who did what, when (logins, approvals, orders, prescriptions...).
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER, actor TEXT, action TEXT NOT NULL, detail TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+
+def _pg_schema(s):
+    """Translate the canonical SQLite schema above into PostgreSQL dialect."""
+    return (s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+             .replace("TEXT NOT NULL DEFAULT (datetime('now'))", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+             .replace("REAL", "DOUBLE PRECISION"))
 
 
 def init_and_seed():
     """Create the tables (no-op if they already exist), then load demo data — but only on a fresh
     database. The `count != 0` guard means an existing DB is left untouched, so restarts don't wipe data."""
-    execute(SCHEMA)
+    execute(_pg_schema(SCHEMA) if IS_PG else SCHEMA)
     if get("SELECT COUNT(*) AS c FROM users")["c"] != 0:
         return
 
@@ -237,19 +293,19 @@ def init_and_seed():
                f"<text x='18' y='100' font-family='sans-serif' font-size='16' fill='#0f766e'>{text}</text></svg>")
         return "data:image/svg+xml," + quote(svg)
 
-    run("UPDATE users SET documents = ? WHERE email = ?", (json.dumps({
+    run("UPDATE users SET documents = ? WHERE email = ?", (crypto.encrypt(json.dumps({
         "Degree certificate": placeholder_doc("MBBS Degree — Dr. Kunal Shah"),
         "Medical license": placeholder_doc("Medical License MH-ORTHO-2231"),
-    }), "kunal@epharma.com"))
-    run("UPDATE users SET documents = ? WHERE email = ?", (json.dumps({
+    })), "kunal@epharma.com"))
+    run("UPDATE users SET documents = ? WHERE email = ?", (crypto.encrypt(json.dumps({
         "Drug license": placeholder_doc("Drug License DL-MH-67890"),
         "GSTIN proof": placeholder_doc("GSTIN 27FGHIJ5678K2Z9"),
-    }), "store@healthkart.com"))
+    })), "store@healthkart.com"))
 
     for c in sorted({m[1] for m in meds}):
-        run("INSERT OR IGNORE INTO taxonomy (type, name) VALUES ('category', ?)", (c,))
+        run("INSERT INTO taxonomy (type, name) VALUES ('category', ?) ON CONFLICT DO NOTHING", (c,))
     for s in ["Cardiology", "Dermatology", "Orthopedics", "General Physician", "Pediatrics"]:
-        run("INSERT OR IGNORE INTO taxonomy (type, name) VALUES ('specialty', ?)", (s,))
+        run("INSERT INTO taxonomy (type, name) VALUES ('specialty', ?) ON CONFLICT DO NOTHING", (s,))
 
     cms = [
         ("faq", "Frequently Asked Questions",
@@ -264,7 +320,7 @@ def init_and_seed():
          "role-based; medical records are shared only with the parties involved in your care. You may request deletion of your data."),
     ]
     for slug, title, body in cms:
-        run("INSERT OR IGNORE INTO cms_pages (slug, title, body) VALUES (?, ?, ?)", (slug, title, body))
+        run("INSERT INTO cms_pages (slug, title, body) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", (slug, title, body))
 
 
 def issue_token(user_id):
@@ -275,5 +331,17 @@ def issue_token(user_id):
 
 
 def public_user(u):
-    """Strip the password hash before a user object is ever sent to the client."""
-    return {k: v for k, v in u.items() if k != "password_hash"}
+    """Strip the password hash, and decrypt verification documents, before a user object is
+    ever sent to the client."""
+    out = {k: v for k, v in u.items() if k != "password_hash"}
+    if out.get("documents"):
+        out["documents"] = crypto.decrypt(out["documents"])
+    return out
+
+
+def audit(user, action, detail=None):
+    """Phase 5: record a security-relevant action in the audit trail.
+    `user` may be a user dict (logged-in actor) or None (anonymous/failed attempts)."""
+    uid = user["id"] if user else None
+    actor = f"{user['name']} ({user['role']})" if user else "anonymous"
+    run("INSERT INTO audit_log (user_id, actor, action, detail) VALUES (?, ?, ?, ?)", (uid, actor, action, detail))

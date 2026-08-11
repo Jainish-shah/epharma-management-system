@@ -34,6 +34,7 @@ urlpatterns = [
     path("admin/users/<int:id>", views.admin_user_detail),
     path("admin/stats", views.admin_stats),
     path("admin/reports", views.admin_reports),
+    path("admin/audit", views.admin_audit),
     path("admin/taxonomy", views.admin_taxonomy),
     path("admin/taxonomy/<int:id>", views.admin_taxonomy_detail),
     path("admin/cms/<str:slug>", views.admin_cms),

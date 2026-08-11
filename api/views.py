@@ -16,11 +16,22 @@ import mimetypes
 import os
 import re
 import secrets
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from . import db, payments, events
+from . import db, payments, events, crypto
+
+
+def _now():
+    """Current UTC time as a sortable 'YYYY-MM-DD HH:MM:SS' string (portable across SQLite/Postgres)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _plus_days(days):
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---- configuration (all overridable by environment variables) ----
 REFILL_DAYS = int(os.environ.get("REFILL_DAYS", "30"))          # days after an order before a refill reminder is due
@@ -39,10 +50,13 @@ def J(data, status=200):
 
 
 def _num(x):
-    # Python prints 60.0 where JS printed 60; SQLite REAL columns come back as floats. Convert
-    # integral floats to ints (recursively) so prices/totals read as "60" not "60.0" in the JSON.
+    # Normalise numbers so SQLite and Postgres produce identical JSON:
+    #   - Postgres SUM/ROUND return Decimal -> make it a float
+    #   - both: an integral float/decimal (60.0) prints as "60" (matches the old JS backend)
     if isinstance(x, bool):
         return x
+    if isinstance(x, Decimal):
+        x = float(x)
     if isinstance(x, float) and x.is_integer():
         return int(x)
     if isinstance(x, dict):
@@ -133,8 +147,8 @@ events.subscribe(TOPICS["NOTIFICATIONS"], _deliver)
 def run_due_refills(patient_id):
     """Turn any refill reminders that have come due into real notifications (checked when the
     patient opens their notifications, so no background scheduler is needed for the demo)."""
-    due = db.query("SELECT * FROM refill_reminders WHERE patient_id = ? AND notified = 0 AND due_date <= datetime('now')",
-                   (patient_id,))
+    due = db.query("SELECT * FROM refill_reminders WHERE patient_id = ? AND notified = 0 AND due_date <= ?",
+                   (patient_id, _now()))
     for r in due:
         notify(patient_id, f"Refill reminder: it may be time to reorder {r['medicine_name']}")
         db.run("UPDATE refill_reminders SET notified = 1 WHERE id = ?", (r["id"],))
@@ -220,7 +234,7 @@ def send_otp(request):
         return J({"error": "Email already registered"}, 400)
     code = gen_otp()
     # upsert: one live code per email (replaces any previous one)
-    db.run("INSERT INTO otps (email, code, created_at) VALUES (?, ?, datetime('now')) "
+    db.run("INSERT INTO otps (email, code, created_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
            "ON CONFLICT(email) DO UPDATE SET code = excluded.code, created_at = excluded.created_at", (email, code))
     print(f"[OTP] {email} -> {code}")
     return J({"otpSent": True, "devOtp": None if os.environ.get("NODE_ENV") == "production" else code})
@@ -258,7 +272,8 @@ def register(request):
             return J({"error": "Invalid or missing OTP — please verify your email/mobile first"}, 400)
 
     status = "approved" if b["role"] == "patient" else "pending"  # providers need admin approval
-    documents = json.dumps(b["documents"]) if isinstance(b.get("documents"), dict) else None  # verification files, if any
+    # verification files, if any — encrypted at rest
+    documents = crypto.encrypt(json.dumps(b["documents"])) if isinstance(b.get("documents"), dict) else None
     uid = db.run(
         "INSERT INTO users (role, name, email, phone, password_hash, status, specialization, qualification, fee, "
         "availability, store_name, license_no, gstin, address, documents) "
@@ -271,6 +286,7 @@ def register(request):
     if status == "pending":
         notify_admins(f"New {b['role']} registration awaiting approval: {b['name']}")
     user = db.get("SELECT * FROM users WHERE id = ?", (uid,))
+    db.audit(user, "register", user["role"])
     # hand back a session token so the new user is logged in immediately
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
@@ -284,7 +300,8 @@ def me_documents(request):
     docs = request.data.get("documents")
     if not isinstance(docs, dict) or not docs:
         return J({"error": "No documents provided"}, 400)
-    db.run("UPDATE users SET documents = ? WHERE id = ?", (json.dumps(docs), user["id"]))
+    db.run("UPDATE users SET documents = ? WHERE id = ?", (crypto.encrypt(json.dumps(docs)), user["id"]))
+    db.audit(user, "documents.upload")
     notify_admins(f"{user['name']} ({user['role']}) uploaded verification documents")
     return J({"ok": True})
 
@@ -295,7 +312,9 @@ def login(request):
     email = request.data.get("email") or ""
     user = db.get("SELECT * FROM users WHERE email = ?", (email,))
     if not user or not db.verify_password(request.data.get("password") or "", user["password_hash"]):
+        db.audit(None, "login.failed", email)  # audit failed attempts (security signal)
         return J({"error": "Invalid email or password"}, 401)  # same message for both cases (don't reveal which)
+    db.audit(user, "login")
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
 
@@ -455,7 +474,7 @@ def orders(request):
     for o in rows:  # attach line items + any prescription to each order
         o["items"] = db.query("SELECT * FROM order_items WHERE order_id = ?", (o["id"],))
         rx = db.get("SELECT content FROM prescriptions WHERE id = ?", (o["prescription_id"],)) if o["prescription_id"] else None
-        o["prescription"] = rx["content"] if rx else None
+        o["prescription"] = crypto.decrypt(rx["content"]) if rx else None
     return J(rows)
 
 
@@ -508,7 +527,7 @@ def _create_order(request):
         prescription_id = None
         if prescription:
             prescription_id = db.run("INSERT INTO prescriptions (patient_id, kind, content) VALUES (?, 'uploaded', ?)",
-                                     (user["id"], prescription))
+                                     (user["id"], crypto.encrypt(prescription)))
         oid = db.run("INSERT INTO orders (patient_id, pharmacy_id, type, address, total, prescription_id) "
                      "VALUES (?, ?, ?, ?, ?, ?)",
                      (user["id"], pharmacy_id, "pickup" if otype == "pickup" else "delivery",
@@ -517,8 +536,8 @@ def _create_order(request):
             db.run("INSERT INTO order_items (order_id, medicine_id, name, price, qty) VALUES (?, ?, ?, ?, ?)",
                    (oid, med["id"], med["name"], med["price"], qty))
             # schedule a refill reminder REFILL_DAYS from now for each medicine bought
-            db.run("INSERT INTO refill_reminders (patient_id, medicine_name, due_date) VALUES (?, ?, datetime('now', ?))",
-                   (user["id"], med["name"], f"+{REFILL_DAYS} days"))
+            db.run("INSERT INTO refill_reminders (patient_id, medicine_name, due_date) VALUES (?, ?, ?)",
+                   (user["id"], med["name"], _plus_days(REFILL_DAYS)))
         db.run("UPDATE payments SET status = 'paid', order_id = ? WHERE id = ?", (oid, pay["id"]))
         # step 4: announce what happened; consumers turn these into logs, receipts, notifications
         events.publish(TOPICS["ORDERS"], {"orderId": oid, "pharmacyId": pharmacy_id, "patientId": user["id"], "total": total})
@@ -529,6 +548,7 @@ def _create_order(request):
     try:
         with db.transaction():  # commit on success, roll back on any raised error
             order_id = place_order()
+        db.audit(user, "order.placed", f"order #{order_id}")
         return J(db.get("SELECT * FROM orders WHERE id = ?", (order_id,)))
     except ValueError as e:
         return J({"error": str(e)}, 400)
@@ -637,13 +657,18 @@ def appointment_messages(request, id):
         if not non_empty(request.data.get("body")):
             return J({"error": "Message cannot be empty"}, 400)
         mid = db.run("INSERT INTO messages (appointment_id, sender_id, body) VALUES (?, ?, ?)",
-                     (appt["id"], user["id"], request.data["body"].strip()))
+                     (appt["id"], user["id"], crypto.encrypt(request.data["body"].strip())))
         other = appt["doctor_id"] if user["id"] == appt["patient_id"] else appt["patient_id"]
         notify(other, f"New consultation message from {user['name']}")
-        return J(db.get("SELECT * FROM messages WHERE id = ?", (mid,)))
-    return J(db.query(
+        row = db.get("SELECT * FROM messages WHERE id = ?", (mid,))
+        row["body"] = crypto.decrypt(row["body"])
+        return J(row)
+    rows = db.query(
         "SELECT m.*, u.name AS sender_name, u.role AS sender_role FROM messages m "
-        "JOIN users u ON u.id = m.sender_id WHERE m.appointment_id = ? ORDER BY m.id", (appt["id"],)))
+        "JOIN users u ON u.id = m.sender_id WHERE m.appointment_id = ? ORDER BY m.id", (appt["id"],))
+    for r in rows:
+        r["body"] = crypto.decrypt(r["body"])  # decrypt consultation messages on the way out
+    return J(rows)
 
 
 @api
@@ -689,8 +714,9 @@ def prescriptions(request):
         if not b.get("content"):
             return J({"error": "Prescription text is required"}, 400)
         pid = db.run("INSERT INTO prescriptions (patient_id, doctor_id, appointment_id, kind, content) "
-                     "VALUES (?, ?, ?, 'eprescription', ?)", (appt["patient_id"], user["id"], appt["id"], b["content"]))
+                     "VALUES (?, ?, ?, 'eprescription', ?)", (appt["patient_id"], user["id"], appt["id"], crypto.encrypt(b["content"])))
         db.run("UPDATE appointments SET status = 'completed' WHERE id = ?", (appt["id"],))
+        db.audit(user, "prescription.created", f"patient #{appt['patient_id']}")
         notify(appt["patient_id"], f"e-Prescription uploaded by {user['name']}")
         return J(db.get("SELECT * FROM prescriptions WHERE id = ?", (pid,)))
     user, err = require_auth(request)
@@ -702,10 +728,13 @@ def prescriptions(request):
         where = "p.doctor_id = ?"
     else:
         return J({"error": "Not allowed for your role"}, 403)
-    return J(db.query(
+    rows = db.query(
         "SELECT p.*, pat.name AS patient_name, doc.name AS doctor_name FROM prescriptions p "
         "JOIN users pat ON pat.id = p.patient_id LEFT JOIN users doc ON doc.id = p.doctor_id "
-        f"WHERE {where} ORDER BY p.id DESC", (user["id"],)))
+        f"WHERE {where} ORDER BY p.id DESC", (user["id"],))
+    for r in rows:
+        r["content"] = crypto.decrypt(r["content"])  # decrypt medical record on the way out
+    return J(rows)
 
 
 @api
@@ -717,8 +746,10 @@ def prescriptions_upload(request):
     content = request.data.get("content")
     if not content:
         return J({"error": "No file received"}, 400)
-    pid = db.run("INSERT INTO prescriptions (patient_id, kind, content) VALUES (?, 'uploaded', ?)", (user["id"], content))
-    return J(db.get("SELECT * FROM prescriptions WHERE id = ?", (pid,)))
+    pid = db.run("INSERT INTO prescriptions (patient_id, kind, content) VALUES (?, 'uploaded', ?)", (user["id"], crypto.encrypt(content)))
+    row = db.get("SELECT * FROM prescriptions WHERE id = ?", (pid,))
+    row["content"] = crypto.decrypt(row["content"])
+    return J(row)
 
 
 # ==================== notifications & earnings ====================
@@ -784,6 +815,7 @@ def admin_user_detail(request, id):
     if status not in ("approved", "rejected"):
         return J({"error": "Invalid status"}, 400)
     db.run("UPDATE users SET status = ? WHERE id = ?", (status, target["id"]))
+    db.audit(user, f"user.{status}", f"{target['role']} #{target['id']} ({target['email']})")
     notify(target["id"], f"Your {target['role']} account was {status} by the admin")
     return J(db.public_user(db.get("SELECT * FROM users WHERE id = ?", (target["id"],))))
 
@@ -815,11 +847,13 @@ def admin_reports(request):
     user, err = require_auth(request, "admin")
     if err:
         return err
+    # NOTE: CAST(...AS TEXT) and CAST(...AS NUMERIC) keep these portable across SQLite and Postgres
+    # (Postgres can't substr a timestamp, and its ROUND needs numeric input).
     return J({
-        "revenue_by_day": db.query("SELECT substr(created_at,1,10) AS day, ROUND(SUM(total),2) AS revenue, COUNT(*) AS orders FROM orders GROUP BY day ORDER BY day"),
+        "revenue_by_day": db.query("SELECT substr(CAST(created_at AS TEXT),1,10) AS day, ROUND(CAST(SUM(total) AS NUMERIC),2) AS revenue, COUNT(*) AS orders FROM orders GROUP BY substr(CAST(created_at AS TEXT),1,10) ORDER BY day"),
         "orders_by_status": db.query("SELECT status, COUNT(*) AS count FROM orders GROUP BY status"),
-        "top_medicines": db.query("SELECT name, SUM(qty) AS units, ROUND(SUM(price*qty),2) AS revenue FROM order_items GROUP BY name ORDER BY units DESC LIMIT 5"),
-        "revenue_by_pharmacy": db.query("SELECT u.store_name AS pharmacy, ROUND(SUM(o.total),2) AS revenue, COUNT(*) AS orders FROM orders o JOIN users u ON u.id=o.pharmacy_id GROUP BY o.pharmacy_id ORDER BY revenue DESC"),
+        "top_medicines": db.query("SELECT name, SUM(qty) AS units, ROUND(CAST(SUM(price*qty) AS NUMERIC),2) AS revenue FROM order_items GROUP BY name ORDER BY units DESC LIMIT 5"),
+        "revenue_by_pharmacy": db.query("SELECT u.store_name AS pharmacy, ROUND(CAST(SUM(o.total) AS NUMERIC),2) AS revenue, COUNT(*) AS orders FROM orders o JOIN users u ON u.id=o.pharmacy_id GROUP BY u.store_name ORDER BY revenue DESC"),
         "appointments_by_status": db.query("SELECT status, COUNT(*) AS count FROM appointments GROUP BY status"),
         "consultations": db.get("SELECT COUNT(*) AS total, COALESCE(SUM(d.fee),0) AS revenue FROM appointments a JOIN users d ON d.id=a.doctor_id WHERE a.status='completed'"),
     })
@@ -834,7 +868,7 @@ def admin_taxonomy(request):
     b = request.data
     if b.get("type") not in ("category", "specialty") or not non_empty(b.get("name")):
         return J({"error": "A type (category/specialty) and name are required"}, 400)
-    db.run("INSERT OR IGNORE INTO taxonomy (type, name) VALUES (?, ?)", (b["type"], b["name"].strip()))
+    db.run("INSERT INTO taxonomy (type, name) VALUES (?, ?) ON CONFLICT DO NOTHING", (b["type"], b["name"].strip()))
     return J(db.get("SELECT * FROM taxonomy WHERE type = ? AND name = ?", (b["type"], b["name"].strip())))
 
 
@@ -857,10 +891,20 @@ def admin_cms(request, slug):
     b = request.data
     if not non_empty(b.get("title")) or not non_empty(b.get("body")):
         return J({"error": "Title and body are required"}, 400)
-    db.run("INSERT INTO cms_pages (slug, title, body, updated_at) VALUES (?, ?, ?, datetime('now')) "
+    db.run("INSERT INTO cms_pages (slug, title, body, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
            "ON CONFLICT(slug) DO UPDATE SET title = excluded.title, body = excluded.body, updated_at = excluded.updated_at",
            (slug, b["title"].strip(), b["body"]))
+    db.audit(user, "cms.update", slug)
     return J(db.get("SELECT * FROM cms_pages WHERE slug = ?", (slug,)))
+
+
+@api
+def admin_audit(request):
+    """GET /api/admin/audit — admin. The most recent 100 audit-trail entries (security review)."""
+    user, err = require_auth(request, "admin")
+    if err:
+        return err
+    return J(db.query("SELECT * FROM audit_log ORDER BY id DESC LIMIT 100"))
 
 
 # ==================== fallthrough: unknown API route + SPA files ====================

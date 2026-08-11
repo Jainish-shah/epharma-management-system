@@ -54,8 +54,14 @@ async function api(path, opts = {}) {
 
 // ---------- modal ----------
 function openModal(html) {
-  $('#modalRoot').innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal">${html}</div></div>`;
+  // role="dialog" + aria-modal tells screen readers this is a modal; Escape closes it.
+  $('#modalRoot').innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal" role="dialog" aria-modal="true">${html}</div></div>`;
+  const first = $('#modalRoot').querySelector('input, textarea, select, button');
+  if (first) first.focus();  // move keyboard focus into the dialog
 }
+
+// Escape closes any open modal (standard dialog behaviour).
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 function closeModal() {
   $('#modalRoot').innerHTML = '';
   if (consultTimer) { clearInterval(consultTimer); consultTimer = null; } // stop chat polling
@@ -76,7 +82,7 @@ async function renderNav() {
     unread = notifs.filter((n) => !n.read).length;
   } catch (e) { /* token may have expired */ }
   right.innerHTML = `
-    <button class="bell" onclick="toggleNotifs()">🔔${unread ? `<span class="count">${unread}</span>` : ''}</button>
+    <button class="bell" onclick="toggleNotifs()" aria-label="Notifications${unread ? `, ${unread} unread` : ''}">🔔${unread ? `<span class="count">${unread}</span>` : ''}</button>
     <span class="nav-user">${esc(user.name)}</span>
     <span class="badge-role">${user.role}</span>
     <button class="btn secondary small" onclick="logout()">Logout</button>`;
@@ -327,8 +333,8 @@ function renderDashboard() {
   }
 
   app.innerHTML = `<div class="container">
-    <div class="tabs">${tabs.map((t) => `<button class="tab ${t === activeTab ? 'active' : ''}" onclick="switchTab('${t}')">${t}</button>`).join('')}</div>
-    <div id="tabContent"><div class="empty">Loading…</div></div>
+    <div class="tabs" role="tablist" aria-label="${esc(user.role)} sections">${tabs.map((t) => `<button class="tab ${t === activeTab ? 'active' : ''}" role="tab" aria-selected="${t === activeTab}" onclick="switchTab('${t}')">${t}</button>`).join('')}</div>
+    <div id="tabContent" role="tabpanel" aria-live="polite"><div class="empty">Loading…</div></div>
   </div>`;
   renderTab();
 }
@@ -561,7 +567,7 @@ async function advanceOrder(id) {
 function viewRx(orderId) {
   const o = $('#tabContent')._orders.find((x) => x.id === orderId);
   const content = o.prescription.startsWith('data:image')
-    ? `<img class="rx-img" style="max-width:100%" src="${o.prescription}" />`
+    ? `<img class="rx-img" style="max-width:100%" src="${o.prescription}" alt="Prescription uploaded for order #${orderId}" />`
     : `<pre style="white-space:pre-wrap;font-family:inherit">${esc(o.prescription)}</pre>`;
   openModal(`<h2>Prescription — order #${orderId}</h2>${content}
     <div class="actions"><button class="btn secondary" onclick="closeModal()">Close</button></div>`);
@@ -718,7 +724,7 @@ async function tabPrescriptions(el) {
           <h3>${r.kind === 'eprescription' ? '🩺 e-Prescription' : '📄 Uploaded'}</h3>
           <div class="meta">${r.doctor_name ? 'By ' + esc(r.doctor_name) + ' · ' : ''}${user.role === 'doctor' ? 'For ' + esc(r.patient_name) + ' · ' : ''}${esc(r.created_at)}</div>
           ${r.content.startsWith('data:image')
-            ? `<img class="rx-img" src="${r.content}" />`
+            ? `<img class="rx-img" src="${r.content}" alt="Prescription document" />`
             : `<pre style="white-space:pre-wrap;font-family:inherit;font-size:13px">${esc(r.content)}</pre>`}
         </div>`).join('')}</div>`
     : '<div class="empty">No prescriptions yet</div>');
@@ -869,7 +875,7 @@ function viewDocs(userId) {
   try { docs = JSON.parse(u.documents || '{}'); } catch (e) {}
   const body = Object.entries(docs).map(([label, src]) =>
     `<label>${esc(label)}</label>${String(src).startsWith('data:image')
-      ? `<img class="rx-img" style="max-width:100%" src="${src}" />`
+      ? `<img class="rx-img" style="max-width:100%" src="${src}" alt="${esc(label)}" />`
       : `<div class="meta">${esc(String(src))}</div>`}`).join('') || '<div class="empty">No documents uploaded</div>';
   openModal(`<h2>Verification documents</h2><div class="sub">${esc(u.name)} · ${esc(u.role)}</div>${body}
     <div class="actions"><button class="btn secondary" onclick="closeModal()">Close</button></div>`);
