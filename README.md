@@ -3,11 +3,11 @@
 Integrated platform connecting patients, doctors and pharmacies — prescription-based ordering,
 teleconsultation booking, inventory management and admin oversight.
 
-**Stack:** Python + Django (REST API) · SQLite via stdlib `sqlite3` · Vanilla JS SPA (no build step) · event streaming (in-process bus, optional Apache Kafka) · Stripe/Razorpay payments (sandbox)
+**Stack:** **React** (Vite) frontend · **Python + Django** REST API · SQLite / PostgreSQL · event streaming (in-process bus, optional Apache Kafka) · Stripe/Razorpay payments (sandbox)
 
 ## Run
 
-Requires Python ≥ 3.11.
+Requires Python ≥ 3.11. The React app is pre-built into `public/`, so **no Node is needed to run it**.
 
 ```bash
 python3 -m venv .venv
@@ -16,8 +16,33 @@ python3 -m venv .venv
 # open http://localhost:3000
 ```
 
-Django serves both the REST API (`/api/...`) and the SPA (`public/`). The database (`epharma.db`)
+Django serves both the REST API (`/api/...`) and the built React app. The database (`epharma.db`)
 is created and seeded with demo data on first run — delete the `epharma.db*` files to reset.
+
+## Frontend development
+
+The React source lives in `frontend/` (Vite + React 18). Node is only needed to change the UI.
+
+```bash
+npm install --prefix frontend          # once
+npm run dev --prefix frontend          # hot-reload dev server on :5174, proxies /api to :3000
+npm run build --prefix frontend        # rebuild public/ (commit the result)
+```
+
+Run Django and `npm run dev` side by side while developing; run the build before committing UI changes.
+
+**Structure**
+
+| Path | Contents |
+|---|---|
+| `frontend/src/App.jsx` | Root: navbar, landing page, dashboard shell and tab routing |
+| `frontend/src/api.js` | Fetch wrapper (auth header, JSON, error handling) + session helpers |
+| `frontend/src/ui.jsx` | Toast + modal dialog via React context (`useUI()`) |
+| `frontend/src/auth.jsx` | Login and registration dialogs (OTP, document upload) |
+| `frontend/src/tabs/patient.jsx` | Medicines, cart & checkout, doctors & booking, refills |
+| `frontend/src/tabs/shared.jsx` | Orders, appointments, teleconsultation, prescriptions |
+| `frontend/src/tabs/provider.jsx` | Doctor earnings/profile, pharmacy inventory |
+| `frontend/src/tabs/admin.jsx` | Overview, reports, approvals, users, catalog, CMS |
 
 ## Test
 

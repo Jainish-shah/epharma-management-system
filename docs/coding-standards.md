@@ -19,11 +19,15 @@ Conventions followed across the codebase. Kept short and enforced by review.
 - **Money & stock computed server-side.** Totals and stock decrements are derived from the database inside a transaction, never taken from the request.
 - **Consistent errors:** handlers return `{ error: "message" }` with an appropriate status; unexpected failures fall through to the central error handler as JSON.
 
-## Frontend (vanilla JS SPA)
+## Frontend (React + Vite)
 
-- **Escape all user-supplied text** with `esc()` before inserting into HTML (XSS-safe rendering).
-- **Single API helper** (`api()`) centralises auth headers and error handling; every call is wrapped in `try/catch` with a user-facing `toast`.
-- **State is explicit:** session token/user in `localStorage`; view state in a few module-level variables. No hidden globals.
+- **Function components and hooks only** — no classes. One component per screen or dialog; tab components live under `src/tabs/` grouped by role.
+- **JSX escapes interpolated text automatically**, which is what keeps rendering XSS-safe. `dangerouslySetInnerHTML` is not used anywhere; keep it that way.
+- **Single API helper** (`api()` in `src/api.js`) centralises the auth header, JSON handling and errors; every call is wrapped in `try/catch` with a user-facing `toast`.
+- **State is explicit:** session token/user in `localStorage` (via `api.js`), everything else in `useState` close to where it is used. Toast and modal are the only global concerns, provided through one context (`useUI()`).
+- **Data is fetched in `useEffect`** by the component that renders it, so each tab owns its own loading.
+- **Accessibility is part of the component**, not an afterthought: label every input, give icon-only buttons an `aria-label`, and keep the dialog/tab ARIA roles when editing `ui.jsx` or the dashboard shell.
+- **`public/` is generated** — never edit it by hand; change `frontend/src` and rebuild.
 
 ## Database
 

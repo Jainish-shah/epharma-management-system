@@ -16,7 +16,7 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 
 ```
 ┌─────────────────────────────────────────────────┐
-│        Client (SPA — HTML/CSS/JavaScript)       │
+│         Client (React SPA — Vite build)         │
 │  Landing · Patient · Doctor · Pharmacy · Admin  │
 └──────────────────────┬──────────────────────────┘
                        │ HTTPS / JSON
@@ -52,7 +52,7 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | Single Django server serving both API and static frontend | One process, one port; simplest deployable unit for this scope |
 | Token-based auth (server-stored session tokens) | Stateless clients, instant revocation on logout |
 | Dual-backend data layer: SQLite by default, PostgreSQL via `DATABASE_URL` (raw driver, not the ORM) | Zero-config for demos, production-grade database for deployment — one code path, verified by the same test suite on both |
-| Vanilla JS SPA, no build step | No toolchain risk; runs anywhere Python ≥ 3.11 serves it |
+| React (Vite) SPA, built into `public/` and served by Django | Component model for a UI of this size; the build output is committed so the app still runs with Python alone (one process, one port, no Node needed to deploy) |
 | Role checks in one `require_auth(*roles)` helper | RBAC enforced at the view boundary, single point of audit |
 | Event bus abstraction (in-process default, Kafka opt-in) | Decouples producers (orders/payments) from consumers (notifications/receipts); scales to multiple instances via Kafka without changing business logic |
 | Payment-provider façade (Stripe / Razorpay) | Uniform verified-checkout flow; provider is a config switch, mock providers keep it fully testable |
