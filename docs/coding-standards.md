@@ -11,8 +11,9 @@ Conventions followed across the codebase. Kept short and enforced by review.
 
 ## Backend (Django)
 
-- **One responsibility per view.** Shared behaviour lives in helpers (`require_auth`, `notify`, `public_user`, validators). Plain Django views + `JsonResponse` (no ORM) so the SQL and JSON contract stay explicit.
-- **Authentication & authorization:** every non-public view calls `require_auth(request, *roles)`. Ownership is re-checked in the query (`WHERE pharmacy_id = ?`), never trusted from the client.
+- **One responsibility per view.** Shared behaviour lives in helpers (`notify`, `public_user`, validators). Plain Django views + `JsonResponse` (no ORM) so the SQL and JSON contract stay explicit.
+- **Authentication & authorization is declarative:** every protected view is decorated `@auth(...roles)`, which enforces the rule and sets `request.user`. Public views use `@api`. Listings scope rows with `role_scope(user, {...})`. Ownership is re-checked in the query (`WHERE pharmacy_id = ?`), never trusted from the client.
+- **Business rules live in exactly one function.** The cart rules (item exists, single pharmacy, stock available, price) are defined once in `price_cart()` and used by both checkout steps, so what priced the payment is what fills the order.
 - **Input validation at the boundary:** validate before touching the database. Use the shared helpers (`is_email`, `is_phone`, `non_empty`, `non_neg_num`). Return `400` with a clear, user-facing message.
 - **Never leak secrets:** `password_hash` is stripped via `public_user` before any user object is returned.
 - **Parameterised SQL only** — all values are bound with `?`/named params; no string concatenation of user input into SQL (SQL-injection safe).

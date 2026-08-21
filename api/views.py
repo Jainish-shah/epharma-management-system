@@ -7,9 +7,17 @@ Each view is a plain function that takes the Django `request`, does its work wit
 `db` helper (raw SQL), and returns JSON via `J(...)`. There is no ORM and no DRF — the SQL and the
 JSON shapes are written out explicitly so the frontend contract is easy to follow.
 
-Two small conventions you'll see everywhere:
-  * `@api`  — wraps a view to parse the JSON body and turn any crash into a clean JSON error.
-  * `require_auth(request, *roles)` — checks the Bearer token and role; returns (user, error).
+Four conventions you'll see everywhere:
+  * `@api`                 — a PUBLIC view. Parses the JSON body, turns any crash into JSON.
+  * `@auth("admin")`       — a PROTECTED view. Rejects the request unless the caller is signed in
+                             with one of the listed roles, then sets `request.user`. The access rule
+                             sits on the line above the function, so it is impossible to forget and
+                             trivial to audit.
+  * `role_scope(user, {...})` — builds the WHERE clause that limits a listing to what a role may see.
+  * `price_cart(items, reserve=)` — the single definition of the cart rules, used by both checkout steps.
+
+`require_auth()` is still available for the few endpoints whose access rule depends on the HTTP
+method (GET /api/medicines is public; POST is pharmacy-only).
 """
 import json
 import mimetypes
@@ -162,8 +170,12 @@ def body(request):
     return json.loads(request.body)  # raises json.JSONDecodeError -> handled by @api below
 
 
+class Forbidden(Exception):
+    """Raised when the caller's role may not access a resource at all (turned into a 403 by @api)."""
+
+
 def api(fn):
-    """Decorator applied to every view: parse the JSON body up front, and convert a bad body or an
+    """Decorator for PUBLIC views: parse the JSON body up front, and convert a bad body or an
     unexpected exception into a clean JSON error (instead of Django's HTML error page)."""
     @csrf_exempt
     def wrapper(request, *a, **kw):
@@ -173,6 +185,8 @@ def api(fn):
             return J({"error": "Malformed JSON in request body"}, 400)
         try:
             return fn(request, *a, **kw)
+        except Forbidden:
+            return J({"error": "Not allowed for your role"}, 403)
         except Exception as e:  # noqa: BLE001
             print("ERROR", repr(e))
             return J({"error": "Internal server error"}, 500)
@@ -180,10 +194,37 @@ def api(fn):
     return wrapper
 
 
+def auth(*roles):
+    """Decorator for PROTECTED views — use instead of @api. Rejects the request unless the caller
+    is logged in (and, when roles are given, holds one of them), then sets `request.user`:
+
+        @auth("admin")                  # admins only
+        def admin_stats(request): ...   # request.user is the signed-in admin
+
+        @auth()                         # any signed-in user
+        @auth("patient", "doctor")      # either role
+
+    Making the requirement part of the signature means every protected endpoint states its own
+    access rule on the line above it — one place to audit, and no way to forget the check.
+    """
+    def decorate(fn):
+        @api
+        def wrapper(request, *a, **kw):
+            user, err = require_auth(request, *roles)
+            if err:
+                return err
+            request.user = user
+            return fn(request, *a, **kw)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return decorate
+
+
 def require_auth(request, *roles):
-    """Look up the caller from their `Authorization: Bearer <token>` header.
+    """Resolve the caller from their `Authorization: Bearer <token>` header.
     Returns (user_dict, None) when allowed, or (None, error_response) to return immediately.
-    Pass role names to restrict (e.g. require_auth(request, 'admin')); no roles = any logged-in user."""
+    Prefer the @auth decorator; this is for the few views whose access rule depends on the HTTP
+    method (e.g. GET /api/medicines is public but POST is pharmacy-only)."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     user = db.get("SELECT u.* FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token = ?", (token,))
     if not user:
@@ -191,6 +232,25 @@ def require_auth(request, *roles):
     if roles and user["role"] not in roles:
         return None, J({"error": "Not allowed for your role"}, 403)
     return user, None
+
+
+def role_scope(user, columns):
+    """Build the WHERE clause that limits a listing to what this role may see.
+
+    `columns` maps each permitted role to the column that must match the caller's id; map a role to
+    None to let it see everything. Roles absent from the map are refused.
+
+        role_scope(user, {"patient": "o.patient_id", "pharmacy": "o.pharmacy_id", "admin": None})
+
+    Returns (where_sql, params). Raises Forbidden for a role that has no entry — the caller lets it
+    propagate and @api turns it into the 403 response.
+    """
+    if user["role"] not in columns:
+        raise Forbidden()
+    column = columns[user["role"]]
+    if column is None:                      # e.g. admin sees every row
+        return "", ()
+    return f"WHERE {column} = ?", (user["id"],)
 
 
 # ==================== public config / taxonomy / cms ====================
@@ -307,12 +367,10 @@ def register(request):
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
 
-@api
+@auth("doctor", "pharmacy")
 def me_documents(request):
     """POST /api/me/documents — doctor/pharmacy. Upload/replace verification documents for review."""
-    user, err = require_auth(request, "doctor", "pharmacy")
-    if err:
-        return err
+    user = request.user
     docs = request.data.get("documents")
     if not isinstance(docs, dict) or not docs:
         return J({"error": "No documents provided"}, 400)
@@ -334,23 +392,18 @@ def login(request):
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
 
-@api
+@auth()
 def logout(request):
     """POST /api/logout — any user. Delete the current token so it can't be reused."""
-    user, err = require_auth(request)
-    if err:
-        return err
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     db.run("DELETE FROM tokens WHERE token = ?", (token,))
     return J({"ok": True})
 
 
-@api
+@auth()
 def me(request):
     """GET /api/me — any user (return profile).  PATCH /api/me — update allowed profile fields."""
-    user, err = require_auth(request)
-    if err:
-        return err
+    user = request.user
     if request.method == "PATCH":
         allowed = ["name", "phone", "address", "availability", "fee", "specialization", "qualification"]
         for key in allowed:  # only whitelisted columns can be changed
@@ -395,13 +448,11 @@ def doctors(request):
         (search, search)))
 
 
-@api
+@auth("pharmacy")
 def medicine_detail(request, id):
     """PATCH /api/medicines/<id> — edit.  DELETE /api/medicines/<id> — remove.
     Pharmacy only, and only for medicines they own (the WHERE clause enforces ownership)."""
-    user, err = require_auth(request, "pharmacy")
-    if err:
-        return err
+    user = request.user
     med = db.get("SELECT * FROM medicines WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
     if not med:
         return J({"error": "Medicine not found"}, 404)
@@ -414,22 +465,28 @@ def medicine_detail(request, id):
     return J(db.get("SELECT * FROM medicines WHERE id = ?", (med["id"],)))
 
 
-@api
+@auth("pharmacy")
 def my_medicines(request):
     """GET /api/my-medicines — pharmacy. The signed-in pharmacy's own inventory."""
-    user, err = require_auth(request, "pharmacy")
-    if err:
-        return err
+    user = request.user
     return J(db.query("SELECT * FROM medicines WHERE pharmacy_id = ? ORDER BY name", (user["id"],)))
 
 
 # ==================== payments (checkout step 1) ====================
-def price_cart(items):
-    """Total up a cart WITHOUT changing stock; raises ValueError on any problem.
-    Used to size the payment before the order is actually placed."""
+def price_cart(items, reserve=False):
+    """The one place the cart rules live: every item exists, all items come from a single pharmacy,
+    and enough stock is on hand. Returns (total, pharmacy_id, [(medicine, qty), ...]) and raises
+    ValueError with a user-facing message on any problem.
+
+    `reserve=False` prices the cart without touching stock — used to size the payment.
+    `reserve=True` also deducts the stock — used when the paid order is actually placed.
+
+    Both checkout steps go through this function so the rule that priced the payment is the same
+    rule that fills the order; they cannot drift apart.
+    """
     if not isinstance(items, list) or not items:
         raise ValueError("Cart is empty")
-    total, pharmacy_id = 0, None
+    total, pharmacy_id, lines = 0, None, []
     for it in items:
         med = db.get("SELECT * FROM medicines WHERE id = ?", (it.get("medicine_id"),))
         if not med:
@@ -440,20 +497,24 @@ def price_cart(items):
         qty = max(1, int(it.get("qty") or 1))
         if med["stock"] < qty:
             raise ValueError(f"Only {med['stock']} left of {med['name']}")
+        if reserve:
+            # Taking the stock is part of the same pass, so the quantity that was checked is exactly
+            # the quantity deducted. Callers run this inside a transaction, so a later failure
+            # (e.g. the amount-tamper check) rolls the deduction back.
+            db.run("UPDATE medicines SET stock = stock - ? WHERE id = ?", (qty, med["id"]))
         total += med["price"] * qty
-    return total, pharmacy_id
+        lines.append((med, qty))
+    return total, pharmacy_id, lines
 
 
-@api
+@auth("patient")
 def payments_create(request):
     """POST /api/payments/create — patient. Create a payment intent sized to the cart.
     Returns the provider order id; on the mock gateway also returns `demoCheckout` (the signed
     fields a real Stripe/Razorpay widget would hand back) so the demo can complete a payment."""
-    user, err = require_auth(request, "patient")
-    if err:
-        return err
+    user = request.user
     try:
-        total, _ = price_cart(request.data.get("items"))
+        total, _, _ = price_cart(request.data.get("items"))
     except ValueError as e:
         return J({"error": str(e)}, 400)
     amount = round(total * 100)  # provider amounts are in the smallest unit (paise)
@@ -475,14 +536,8 @@ def orders(request):
     user, err = require_auth(request)
     if err:
         return err
-    if user["role"] == "patient":
-        where, params = "WHERE o.patient_id = ?", (user["id"],)
-    elif user["role"] == "pharmacy":
-        where, params = "WHERE o.pharmacy_id = ?", (user["id"],)
-    elif user["role"] == "admin":
-        where, params = "", ()
-    else:
-        return J({"error": "Not allowed for your role"}, 403)
+    # patients see their own orders, pharmacies the ones placed with them, admins everything
+    where, params = role_scope(user, {"patient": "o.patient_id", "pharmacy": "o.pharmacy_id", "admin": None})
     rows = db.query(
         "SELECT o.*, p.name AS patient_name, ph.store_name FROM orders o "
         "JOIN users p ON p.id = o.patient_id JOIN users ph ON ph.id = o.pharmacy_id "
@@ -523,21 +578,9 @@ def _create_order(request):
         return J({"error": "Payment verification failed"}, 402)
 
     def place_order():
-        # steps 2 & 3 run inside the transaction below
-        total, pharmacy_id, lines = 0, None, []
-        for it in items:
-            med = db.get("SELECT * FROM medicines WHERE id = ?", (it.get("medicine_id"),))
-            if not med:
-                raise ValueError("Medicine not found")
-            if pharmacy_id and pharmacy_id != med["pharmacy_id"]:
-                raise ValueError("All items must be from one pharmacy")
-            pharmacy_id = med["pharmacy_id"]
-            qty = max(1, int(it.get("qty") or 1))
-            if med["stock"] < qty:
-                raise ValueError(f"Only {med['stock']} left of {med['name']}")
-            db.run("UPDATE medicines SET stock = stock - ? WHERE id = ?", (qty, med["id"]))
-            total += med["price"] * qty
-            lines.append((med, qty))
+        # steps 2 & 3 run inside the transaction below. Re-pricing here (rather than trusting the
+        # total from checkout) is what makes the anti-tamper check meaningful.
+        total, pharmacy_id, lines = price_cart(items, reserve=True)
         if round(total * 100) != pay["amount"]:  # anti-tamper: paid amount must match the cart
             raise ValueError("Paid amount does not match cart total")
         prescription_id = None
@@ -570,13 +613,11 @@ def _create_order(request):
         return J({"error": str(e)}, 400)
 
 
-@api
+@auth("pharmacy")
 def order_detail(request, id):
     """PATCH /api/orders/<id> — pharmacy advances the order one step along its pipeline
     (pending -> preparing -> shipped/ready -> delivered/picked_up, branching on delivery vs pickup)."""
-    user, err = require_auth(request, "pharmacy")
-    if err:
-        return err
+    user = request.user
     order = db.get("SELECT * FROM orders WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
     if not order:
         return J({"error": "Order not found"}, 404)
@@ -612,26 +653,18 @@ def appointments(request):
     user, err = require_auth(request)
     if err:
         return err
-    if user["role"] == "patient":
-        where, params = "WHERE a.patient_id = ?", (user["id"],)
-    elif user["role"] == "doctor":
-        where, params = "WHERE a.doctor_id = ?", (user["id"],)
-    elif user["role"] == "admin":
-        where, params = "", ()
-    else:
-        return J({"error": "Not allowed for your role"}, 403)
+    # patients see their own appointments, doctors their own, admins everything
+    where, params = role_scope(user, {"patient": "a.patient_id", "doctor": "a.doctor_id", "admin": None})
     return J(db.query(
         "SELECT a.*, p.name AS patient_name, d.name AS doctor_name, d.specialization, d.fee FROM appointments a "
         "JOIN users p ON p.id = a.patient_id JOIN users d ON d.id = a.doctor_id "
         f"{where} ORDER BY a.id DESC", params))
 
 
-@api
+@auth("doctor")
 def appointment_detail(request, id):
     """PATCH /api/appointments/<id> — doctor accepts/rejects/completes their own appointment."""
-    user, err = require_auth(request, "doctor")
-    if err:
-        return err
+    user = request.user
     appt = db.get("SELECT * FROM appointments WHERE id = ? AND doctor_id = ?", (id, user["id"]))
     if not appt:
         return J({"error": "Appointment not found"}, 404)
@@ -657,13 +690,11 @@ def appt_for_user(id, user):
 
 
 # ==================== teleconsultation: chat + video ====================
-@api
+@auth("patient", "doctor")
 def appointment_messages(request, id):
     """GET .../messages — read the consultation thread.  POST .../messages — send a message.
     Only the two parties can access it, and only once the appointment is confirmed."""
-    user, err = require_auth(request, "patient", "doctor")
-    if err:
-        return err
+    user = request.user
     appt = appt_for_user(id, user)
     if not appt:
         return J({"error": "Appointment not found"}, 404)  # also the "you're not a party" response
@@ -687,13 +718,11 @@ def appointment_messages(request, id):
     return J(rows)
 
 
-@api
+@auth("patient", "doctor")
 def appointment_room(request, id):
     """GET /api/appointments/<id>/room — return a Jitsi video-room URL for this appointment.
     The room name is derived from a secret + the id, so it's stable for both parties but not guessable."""
-    user, err = require_auth(request, "patient", "doctor")
-    if err:
-        return err
+    user = request.user
     appt = appt_for_user(id, user)
     if not appt:
         return J({"error": "Appointment not found"}, 404)
@@ -706,12 +735,10 @@ def appointment_room(request, id):
 
 
 # ==================== refills & prescriptions ====================
-@api
+@auth("patient")
 def refills(request):
     """GET /api/refills — patient. Their scheduled refill reminders (soonest first)."""
-    user, err = require_auth(request, "patient")
-    if err:
-        return err
+    user = request.user
     return J(db.query("SELECT * FROM refill_reminders WHERE patient_id = ? ORDER BY due_date", (user["id"],)))
 
 
@@ -738,27 +765,22 @@ def prescriptions(request):
     user, err = require_auth(request)
     if err:
         return err
-    if user["role"] == "patient":
-        where = "p.patient_id = ?"
-    elif user["role"] == "doctor":
-        where = "p.doctor_id = ?"
-    else:
-        return J({"error": "Not allowed for your role"}, 403)
+    # medical records are narrower than orders: only the patient and the prescribing doctor —
+    # admins are deliberately NOT given a role here.
+    where, params = role_scope(user, {"patient": "p.patient_id", "doctor": "p.doctor_id"})
     rows = db.query(
         "SELECT p.*, pat.name AS patient_name, doc.name AS doctor_name FROM prescriptions p "
         "JOIN users pat ON pat.id = p.patient_id LEFT JOIN users doc ON doc.id = p.doctor_id "
-        f"WHERE {where} ORDER BY p.id DESC", (user["id"],))
+        f"{where} ORDER BY p.id DESC", params)
     for r in rows:
         r["content"] = crypto.decrypt(r["content"])  # decrypt medical record on the way out
     return J(rows)
 
 
-@api
+@auth("patient")
 def prescriptions_upload(request):
     """POST /api/prescriptions/upload — patient uploads a prescription image (base64 data URL)."""
-    user, err = require_auth(request, "patient")
-    if err:
-        return err
+    user = request.user
     content = request.data.get("content")
     if not content:
         return J({"error": "No file received"}, 400)
@@ -769,45 +791,36 @@ def prescriptions_upload(request):
 
 
 # ==================== notifications & earnings ====================
-@api
+@auth()
 def notifications(request):
     """GET /api/notifications — latest 30 for the caller. For patients, first materialise any
     refill reminders that have come due (so they show up here without a background job)."""
-    user, err = require_auth(request)
-    if err:
-        return err
+    user = request.user
     if user["role"] == "patient":
         run_due_refills(user["id"])
     return J(db.query("SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30", (user["id"],)))
 
 
-@api
+@auth()
 def notifications_read(request):
     """POST /api/notifications/read — mark all of the caller's notifications as read."""
-    user, err = require_auth(request)
-    if err:
-        return err
+    user = request.user
     db.run("UPDATE notifications SET read = 1 WHERE user_id = ?", (user["id"],))
     return J({"ok": True})
 
 
-@api
+@auth("doctor")
 def earnings(request):
     """GET /api/earnings — doctor. Completed-consultation count and total (count × fee)."""
-    user, err = require_auth(request, "doctor")
-    if err:
-        return err
+    user = request.user
     row = db.get("SELECT COUNT(*) AS consultations FROM appointments WHERE doctor_id = ? AND status = 'completed'", (user["id"],))
     return J({"consultations": row["consultations"], "total": row["consultations"] * (user["fee"] or 0)})
 
 
 # ==================== admin ====================
-@api
+@auth("admin")
 def admin_users(request):
     """GET /api/admin/users?status=&role= — admin. All non-admin users, optionally filtered."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
     sql, params = "SELECT * FROM users WHERE role != 'admin'", []
     if request.GET.get("status"):
         sql += " AND status = ?"
@@ -818,12 +831,10 @@ def admin_users(request):
     return J([db.public_user(u) for u in db.query(sql + " ORDER BY id DESC", params)])
 
 
-@api
+@auth("admin")
 def admin_user_detail(request, id):
     """PATCH /api/admin/users/<id> — admin approves or rejects a pending doctor/pharmacy."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
+    user = request.user
     target = db.get("SELECT * FROM users WHERE id = ?", (id,))
     if not target:
         return J({"error": "User not found"}, 404)
@@ -836,12 +847,9 @@ def admin_user_detail(request, id):
     return J(db.public_user(db.get("SELECT * FROM users WHERE id = ?", (target["id"],))))
 
 
-@api
+@auth("admin")
 def admin_stats(request):
     """GET /api/admin/stats — admin. Headline KPI counts for the dashboard overview."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
 
     def c(sql):
         return db.get(sql)["c"]
@@ -857,12 +865,9 @@ def admin_stats(request):
     })
 
 
-@api
+@auth("admin")
 def admin_reports(request):
     """GET /api/admin/reports — admin. Aggregation queries powering the Reports charts."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
     # NOTE: CAST(...AS TEXT) and CAST(...AS NUMERIC) keep these portable across SQLite and Postgres
     # (Postgres can't substr a timestamp, and its ROUND needs numeric input).
     return J({
@@ -875,12 +880,9 @@ def admin_reports(request):
     })
 
 
-@api
+@auth("admin")
 def admin_taxonomy(request):
     """POST /api/admin/taxonomy — admin adds a category or specialty (ignored if it already exists)."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
     b = request.data
     if b.get("type") not in ("category", "specialty") or not non_empty(b.get("name")):
         return J({"error": "A type (category/specialty) and name are required"}, 400)
@@ -888,22 +890,17 @@ def admin_taxonomy(request):
     return J(db.get("SELECT * FROM taxonomy WHERE type = ? AND name = ?", (b["type"], b["name"].strip())))
 
 
-@api
+@auth("admin")
 def admin_taxonomy_detail(request, id):
     """DELETE /api/admin/taxonomy/<id> — admin removes a category or specialty."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
     db.run("DELETE FROM taxonomy WHERE id = ?", (id,))
     return J({"ok": True})
 
 
-@api
+@auth("admin")
 def admin_cms(request, slug):
     """PUT /api/admin/cms/<slug> — admin creates or updates a CMS page (upsert on slug)."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
+    user = request.user
     b = request.data
     if not non_empty(b.get("title")) or not non_empty(b.get("body")):
         return J({"error": "Title and body are required"}, 400)
@@ -914,12 +911,9 @@ def admin_cms(request, slug):
     return J(db.get("SELECT * FROM cms_pages WHERE slug = ?", (slug,)))
 
 
-@api
+@auth("admin")
 def admin_audit(request):
     """GET /api/admin/audit — admin. The most recent 100 audit-trail entries (security review)."""
-    user, err = require_auth(request, "admin")
-    if err:
-        return err
     return J(db.query("SELECT * FROM audit_log ORDER BY id DESC LIMIT 100"))
 
 
