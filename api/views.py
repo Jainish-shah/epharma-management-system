@@ -34,9 +34,9 @@ def _plus_days(days):
     return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---- configuration (all overridable by environment variables) ----
-REFILL_DAYS = int(os.environ.get("REFILL_DAYS", "30"))          # days after an order before a refill reminder is due
-NOTIFY_CHANNELS = os.environ.get("NOTIFY_CHANNELS", "log").split(",")  # where notifications are "delivered" (log/email/sms)
-CONSULT_SECRET = os.environ.get("CONSULT_SECRET", "epharma-consult-secret")  # salts the Jitsi video room name
+REFILL_DAYS = int(os.environ.get("REFILL_DAYS") or 30)          # days after an order before a refill reminder is due
+NOTIFY_CHANNELS = (os.environ.get("NOTIFY_CHANNELS") or "log").split(",")  # where notifications are "delivered" (log/email/sms)
+CONSULT_SECRET = os.environ.get("CONSULT_SECRET") or "epharma-consult-secret"  # salts the Jitsi video room name
 NEXT_STATUS = {"pending": "preparing", "preparing": None, "shipped": "delivered", "ready": "picked_up"}  # order pipeline
 PUBLIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public")  # the SPA files
 
@@ -198,6 +198,22 @@ def require_auth(request, *roles):
 def config(request):
     """GET /api/config — public. Tells the frontend which payment provider is active."""
     return J({"paymentProvider": payments.provider, "mock": payments.IS_MOCK})
+
+
+@api
+def health(request):
+    """GET /api/health — public. Liveness/readiness probe for load balancers and deploys.
+    Returns 200 only if the database actually answers a query; 503 otherwise."""
+    try:
+        db.get("SELECT 1 AS ok")
+        return J({
+            "status": "ok",
+            "database": "postgresql" if db.IS_PG else "sqlite",
+            "paymentProvider": payments.provider,
+            "events": "kafka" if events.kafka_ready() else "in-process",
+        })
+    except Exception as e:  # noqa: BLE001 — a failing probe must report, not crash
+        return J({"status": "unavailable", "error": str(e)}, 503)
 
 
 @api

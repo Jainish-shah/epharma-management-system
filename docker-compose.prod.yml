@@ -1,0 +1,49 @@
+# Production-shaped stack: the app on gunicorn + PostgreSQL.
+#
+#   cp .env.example .env     # then edit .env — it MUST contain a real DJANGO_SECRET_KEY
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# TLS is expected to terminate in front of this (load balancer, or a reverse proxy such as Caddy or
+# nginx). The app trusts X-Forwarded-Proto, so it knows the original request was HTTPS.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-epharma}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-epharma}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-epharma}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy   # don't boot the app before PostgreSQL accepts connections
+    environment:
+      DJANGO_DEBUG: "0"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost}
+      # TLS terminates at the proxy in front of this stack, so the app itself doesn't redirect.
+      DJANGO_SSL_REDIRECT: ${DJANGO_SSL_REDIRECT:-0}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-epharma}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-epharma}
+      EPHARMA_ENC_KEY: ${EPHARMA_ENC_KEY:?set EPHARMA_ENC_KEY in .env}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-stripe}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-}
+      NOTIFY_CHANNELS: ${NOTIFY_CHANNELS:-log}
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+
+volumes:
+  pgdata:

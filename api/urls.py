@@ -4,6 +4,7 @@ from . import views
 # Paths are relative to /api/ (mounted in epharma_site/urls.py).
 urlpatterns = [
     path("config", views.config),
+    path("health", views.health),
     path("taxonomy", views.taxonomy),
     path("cms", views.cms_list),
     path("cms/<str:slug>", views.cms_page),

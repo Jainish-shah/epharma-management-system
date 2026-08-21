@@ -1,5 +1,6 @@
 Django>=5.2,<6.0
 cryptography>=42.0        # encryption at rest for prescriptions, messages and documents
 psycopg[binary]>=3.1      # PostgreSQL driver (only used when DATABASE_URL is set)
+gunicorn>=22.0            # production WSGI server (the Django dev server is not for production)
 # Optional — only needed when KAFKA_BROKERS is set (event streaming through Apache Kafka):
 # kafka-python>=2.0

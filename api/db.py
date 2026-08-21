@@ -27,9 +27,18 @@ if IS_PG:
     # client_encoding=UTF8 so Unicode content (₹, em-dashes, names) round-trips regardless of server locale
     _conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row, client_encoding="UTF8")
 else:
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # autocommit; explicit BEGIN for txns
+    # timeout: wait for a lock instead of failing instantly — several server workers boot at once
+    # and briefly contend while creating/seeding the schema.
+    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None, timeout=20)
     _conn.row_factory = sqlite3.Row
-    _conn.execute("PRAGMA journal_mode = WAL")
+    _conn.execute("PRAGMA busy_timeout = 20000")  # set FIRST so every later statement waits its turn
+    try:
+        # WAL lets readers run alongside the writer. It is a persistent property of the database
+        # file, so if a sibling worker is mid-switch and this fails, the mode is (or is about to be)
+        # set anyway — not worth failing a boot over.
+        _conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     _conn.execute("PRAGMA foreign_keys = ON")
 _lock = threading.RLock()  # serialise access (dev server is threaded; one shared connection)
 
@@ -92,14 +101,18 @@ def execute(script):
 #   with db.transaction():
 #       ... several db.run(...) calls ...
 # If the block raises, everything is rolled back (used by order placement so stock/order stay in sync).
+#
+# `immediate=True` takes the write lock up front on SQLite (BEGIN IMMEDIATE) instead of on first
+# write, so a read-then-write sequence can't interleave with another process. Needed when several
+# server workers boot at once — see init_and_seed().
 @contextlib.contextmanager
-def transaction():
+def transaction(immediate=False):
     with _lock:
         if IS_PG:
             with _conn.transaction():
                 yield
         else:
-            _conn.execute("BEGIN")
+            _conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
                 yield
                 _conn.execute("COMMIT")
@@ -226,6 +239,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 """
 
 
+# Arbitrary but fixed id for the PostgreSQL advisory lock that serialises schema creation/seeding.
+_INIT_LOCK_ID = 8274613509
+
+
 def _pg_schema(s):
     """Translate the canonical SQLite schema above into PostgreSQL dialect."""
     return (s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
@@ -235,10 +252,36 @@ def _pg_schema(s):
 
 def init_and_seed():
     """Create the tables (no-op if they already exist), then load demo data — but only on a fresh
-    database. The `count != 0` guard means an existing DB is left untouched, so restarts don't wipe data."""
-    execute(_pg_schema(SCHEMA) if IS_PG else SCHEMA)
-    if get("SELECT COUNT(*) AS c FROM users")["c"] != 0:
-        return
+    database. An existing database is left untouched, so restarts never wipe data.
+
+    Safe to call from several processes at once: production runs multiple server workers, and they
+    all boot simultaneously. The check-and-seed happens inside one transaction (with the write lock
+    taken up front on SQLite); should two workers still race, the loser hits a unique-constraint
+    error, re-checks, and exits quietly because the winner has already seeded.
+    """
+    if IS_PG:
+        # PostgreSQL's CREATE TABLE IF NOT EXISTS is NOT atomic against a concurrent creation of the
+        # same table (both sessions see "not exists" and one fails on pg_type). An advisory lock
+        # serialises schema creation and seeding across workers; it is released in the finally block.
+        _conn.execute("SELECT pg_advisory_lock(%s)", (_INIT_LOCK_ID,))
+    try:
+        execute(_pg_schema(SCHEMA) if IS_PG else SCHEMA)
+        try:
+            with transaction(immediate=True):
+                if get("SELECT COUNT(*) AS c FROM users")["c"] != 0:
+                    return
+                _seed_demo_data()
+        except Exception:
+            if get("SELECT COUNT(*) AS c FROM users")["c"] == 0:
+                raise  # genuinely failed, not a lost race
+            return
+    finally:
+        if IS_PG:
+            _conn.execute("SELECT pg_advisory_unlock(%s)", (_INIT_LOCK_ID,))
+
+
+def _seed_demo_data():
+    """Insert the demo users, catalog, taxonomy and CMS pages. Called once, on a fresh database."""
 
     def add_user(**u):
         cols = ["role", "name", "email", "phone", "password_hash", "status", "specialization",

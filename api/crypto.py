@@ -13,7 +13,7 @@ import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
-_secret = os.environ.get("EPHARMA_ENC_KEY", "epharma-demo-key-change-in-production")
+_secret = os.environ.get("EPHARMA_ENC_KEY") or "epharma-demo-key-change-in-production"
 # Fernet needs a 32-byte urlsafe-base64 key; derive one deterministically from the secret.
 _key = base64.urlsafe_b64encode(hashlib.sha256(_secret.encode()).digest())
 _f = Fernet(_key)

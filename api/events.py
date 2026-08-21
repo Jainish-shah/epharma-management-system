@@ -17,6 +17,11 @@ _producer = None
 _kafka_ready = False
 
 
+def kafka_ready():
+    """True when events are streaming through Kafka; False when using the in-process bus."""
+    return _kafka_ready
+
+
 def subscribe(topic, handler):
     _handlers.setdefault(topic, []).append(handler)
 

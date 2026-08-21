@@ -19,8 +19,8 @@ def _safe_eq(a, b):
 
 
 # ---------------- Stripe (PaymentIntents) ----------------
-_STRIPE_SECRET = os.environ.get("STRIPE_SECRET_KEY", "sk_test_mock")
-_STRIPE_PUB = os.environ.get("STRIPE_PUBLISHABLE_KEY", "pk_test_mock")
+_STRIPE_SECRET = os.environ.get("STRIPE_SECRET_KEY") or "sk_test_mock"
+_STRIPE_PUB = os.environ.get("STRIPE_PUBLISHABLE_KEY") or "pk_test_mock"
 
 
 class _Stripe:
@@ -44,8 +44,8 @@ class _Stripe:
 
 
 # ---------------- Razorpay (Orders) ----------------
-_RZP_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_mock")
-_RZP_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "mock_secret")
+_RZP_KEY_ID = os.environ.get("RAZORPAY_KEY_ID") or "rzp_test_mock"
+_RZP_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET") or "mock_secret"
 
 
 class _Razorpay:
@@ -70,7 +70,7 @@ class _Razorpay:
 
 
 _PROVIDERS = {"stripe": _Stripe(), "razorpay": _Razorpay()}
-_active = _PROVIDERS.get(os.environ.get("PAYMENT_PROVIDER", "stripe").lower(), _PROVIDERS["stripe"])
+_active = _PROVIDERS.get((os.environ.get("PAYMENT_PROVIDER") or "stripe").lower(), _PROVIDERS["stripe"])
 
 provider = _active.name
 IS_MOCK = _active.is_mock
