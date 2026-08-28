@@ -88,8 +88,8 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 
 | Table | Key fields | Notes |
 |---|---|---|
-| `users` | role, email (unique), password_hash, status, role-specific columns | Single-table design; `status` drives approval flow |
-| `tokens` | token → user_id | Session store |
+| `users` | role, email (unique), password_hash, status, role-specific columns, consent_version/consent_at, anonymised_at | Single-table design; `status` drives approval flow; consent and erasure recorded here (Phase 7) |
+| `tokens` | token → user_id, created_at | Session store; `created_at` lets idle sessions be purged |
 | `medicines` | pharmacy_id, name, category, price, stock | Per-pharmacy inventory |
 | `orders` | patient_id, pharmacy_id, status, type, total, prescription_id | Total computed server-side |
 | `order_items` | order_id, medicine_id, name, price, qty | Price snapshotted at purchase |
@@ -101,7 +101,7 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | `refill_reminders` | patient_id, medicine_name, due_date, notified | Materialised into notifications when due |
 | `taxonomy` | type (category/specialty), name | Admin-managed lists; advisory `<datalist>` suggestions |
 | `cms_pages` | slug, title, body | Admin-editable FAQ / Terms / Privacy |
-| `audit_log` | user_id, actor, action, detail | Security trail: logins, approvals, orders, prescriptions |
+| `audit_log` | user_id, actor, action, detail | Security trail: logins, approvals, orders, prescriptions, consent, erasure |
 
 ## 5. API Architecture
 
@@ -114,7 +114,10 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 - **Server-side validation:** prices and totals computed from DB, stock checked transactionally, status transitions whitelisted.
 - **Encryption at rest (Phase 5):** prescriptions, consultation messages and verification documents are encrypted with Fernet (AES-CBC + HMAC) before storage, so a stolen database contains ciphertext.
 - **Audit logging (Phase 5):** logins (including failed attempts), registrations, approvals, orders, prescriptions and CMS edits are recorded in `audit_log` and reviewable by admins.
-- **Remaining for full HIPAA/GDPR alignment:** data-retention policy, consent capture at registration, key rotation via a managed secrets store, and TLS termination in the deployment (Phase 6).
+- **Consent (Phase 7):** registration requires explicit consent; the policy version and timestamp are stored and audited.
+- **Subject rights (Phase 7):** each person can export everything held about them and request erasure; erasure overwrites identifying fields while retaining de-identified medical/financial records for their statutory period.
+- **Retention (Phase 7):** per-record-type windows, purged on a schedule.
+- **Key rotation (Phase 7):** a retired key can still decrypt while the new key encrypts, with a command to re-encrypt existing rows.
 
 ## 7. Development Plan (13 July – 17 September 2026)
 
@@ -129,7 +132,7 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 
 ## 8. Testing Strategy
 
-- **Now:** automated end-to-end API suite (`bash test.sh`) — 49 assertions, passing on **both SQLite and PostgreSQL**, plus a load-test script (`bash loadtest.sh`). Covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, CMS editing, encryption-at-rest verification (asserts the raw database column is ciphertext) and the audit trail. Runs against a throwaway database.
+- **Now:** automated end-to-end API suite (`bash test.sh`) — 65 assertions, passing on **both SQLite and PostgreSQL**, plus a load-test script (`bash loadtest.sh`). Covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, CMS editing, encryption-at-rest verification (asserts the raw database column is ciphertext) and the audit trail. Runs against a throwaway database.
 - **Later phases:** browser automation for critical UI flows; production smoke tests after deployment.
 
 ## 9. Risks & Mitigations

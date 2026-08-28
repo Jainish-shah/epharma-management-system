@@ -221,6 +221,63 @@ export function CatalogTab() {
   return <>{group('category', 'Medicine categories')}{group('specialty', 'Doctor specialties')}</>;
 }
 
+/* ---------- Retention: the data-retention policy, and running the purge (Phase 7) ---------- */
+export function RetentionTab() {
+  const { toast } = useUI();
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const purge = async () => {
+    setBusy(true);
+    try {
+      setResult(await api('/api/admin/retention/purge', { method: 'POST' }));
+      toast('Retention purge complete');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const LABELS = {
+    otps: 'One-time verification codes',
+    tokens: 'Idle sign-in sessions',
+    notifications: 'Read notifications',
+    audit_log: 'Security audit trail',
+  };
+
+  return (
+    <>
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3>Data retention policy</h3>
+        <div className="meta" style={{ marginTop: 6, marginBottom: 12 }}>
+          Records are deleted once they pass the window below. Medical and financial records
+          (orders, payments, prescriptions) are governed by statutory retention and are not purged here.
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Record type</th><th>Kept for</th>{result && <th>Removed just now</th>}</tr></thead>
+            <tbody>
+              {Object.entries(result?.policy_days || { otps: 1, tokens: 30, notifications: 180, audit_log: 365 })
+                .map(([k, days]) => (
+                  <tr key={k}>
+                    <td>{LABELS[k] || k}</td>
+                    <td>{days} day{Number(days) === 1 ? '' : 's'}</td>
+                    {result && <td>{result.removed[k]}</td>}
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="row" style={{ marginTop: 12 }}>
+          <span className="meta">Normally run by a nightly scheduled job; can also be run on demand.</span>
+          <button className="btn" onClick={purge} disabled={busy}>{busy ? 'Purging…' : 'Run purge now'}</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 /* ---------- Content: edit the CMS pages ---------- */
 export function ContentTab() {
   const { toast } = useUI();

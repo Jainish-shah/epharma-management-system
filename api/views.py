@@ -30,7 +30,7 @@ from decimal import Decimal
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from . import db, payments, events, crypto
+from . import db, payments, events, crypto, compliance
 
 
 def _now():
@@ -340,6 +340,10 @@ def register(request):
         return J({"error": "Fee must be a non-negative number"}, 400)
     if db.get("SELECT id FROM users WHERE email = ?", (b["email"],)):
         return J({"error": "Email already registered"}, 400)
+    # Consent must be explicit and affirmative — an account cannot be created without it, and the
+    # policy version accepted is recorded so a later policy change can be re-consented (Phase 7).
+    if b.get("consent") is not True:
+        return J({"error": "You must accept the privacy policy and consent to your data being processed"}, 400)
 
     # --- patients: verify the OTP issued by send-otp ---
     if b["role"] == "patient":
@@ -352,17 +356,20 @@ def register(request):
     documents = crypto.encrypt(json.dumps(b["documents"])) if isinstance(b.get("documents"), dict) else None
     uid = db.run(
         "INSERT INTO users (role, name, email, phone, password_hash, status, specialization, qualification, fee, "
-        "availability, store_name, license_no, gstin, address, documents) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "availability, store_name, license_no, gstin, address, documents, consent_version, consent_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (b["role"], b["name"].strip(), b["email"], b.get("phone") or None, db.hash_password(b["password"]), status,
          b.get("specialization") or None, b.get("qualification") or None, b.get("fee") or None,
          b.get("availability") or None, b.get("store_name") or None, b.get("license_no") or None,
-         b.get("gstin") or None, b.get("address") or None, documents))
+         b.get("gstin") or None, b.get("address") or None, documents,
+         compliance.POLICY_VERSION, _now()))
     db.run("DELETE FROM otps WHERE email = ?", (b["email"],))  # OTP is single-use
     if status == "pending":
         notify_admins(f"New {b['role']} registration awaiting approval: {b['name']}")
     user = db.get("SELECT * FROM users WHERE id = ?", (uid,))
     db.audit(user, "register", user["role"])
+    # Consent is a provable event, so it goes in the audit trail as well as on the account.
+    db.audit(user, "consent.granted", f"privacy policy v{compliance.POLICY_VERSION}")
     # hand back a session token so the new user is logged in immediately
     return J({"token": db.issue_token(user["id"]), "user": db.public_user(user)})
 
@@ -909,6 +916,46 @@ def admin_cms(request, slug):
            (slug, b["title"].strip(), b["body"]))
     db.audit(user, "cms.update", slug)
     return J(db.get("SELECT * FROM cms_pages WHERE slug = ?", (slug,)))
+
+
+# ==================== data governance (Phase 7) ====================
+@auth()
+def me_data(request):
+    """GET /api/me/data — any signed-in user. Everything held about them, decrypted (right of
+    access / data portability). Downloading it is a routine action, so it is only audited, not
+    restricted."""
+    user = request.user
+    db.audit(user, "data.exported")
+    return J(compliance.export_user_data(user))
+
+
+@auth()
+def me_delete(request):
+    """DELETE /api/me — right to erasure. Overwrites the personal details, disables the login and
+    ends every session. Medical and financial records are kept in de-identified form for their
+    statutory retention period (see api/compliance.py for the reasoning).
+
+    Requires the account password in the body, so a stolen session token alone cannot erase an
+    account, and admins cannot erase themselves (there must always be an operator).
+    """
+    user = request.user
+    if user["role"] == "admin":
+        return J({"error": "Administrator accounts cannot be self-erased; ask another administrator"}, 400)
+    if not db.verify_password(request.data.get("password") or "", user["password_hash"]):
+        return J({"error": "Password confirmation is required to erase your account"}, 403)
+    db.audit(user, "data.erased", f"{user['role']} #{user['id']}")  # logged BEFORE identity is removed
+    return J(compliance.erase_user(user))
+
+
+@auth("admin")
+def admin_retention(request):
+    """POST /api/admin/retention/purge — admin. Delete records past their retention window.
+    Intended to be called by a nightly scheduled job; exposed here so it can also be run on demand
+    and so the policy is visible in the interface."""
+    user = request.user
+    removed = compliance.purge_expired()
+    db.audit(user, "retention.purged", ", ".join(f"{k}={v}" for k, v in removed.items()))
+    return J({"policy_days": compliance.RETENTION_DAYS, "removed": removed})
 
 
 @auth("admin")

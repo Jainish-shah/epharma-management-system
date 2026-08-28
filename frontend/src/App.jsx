@@ -11,14 +11,15 @@ import { LoginForm, RegisterForm } from './auth';
 import { CartModal, DoctorsTab, MedicinesTab, RefillsTab } from './tabs/patient';
 import { AppointmentsTab, OrdersTab, PrescriptionsTab } from './tabs/shared';
 import { EarningsTab, InventoryTab, ProfileTab } from './tabs/provider';
-import { ApprovalsTab, CatalogTab, ContentTab, OverviewTab, ReportsTab, UsersTab } from './tabs/admin';
+import { ApprovalsTab, CatalogTab, ContentTab, OverviewTab, ReportsTab, RetentionTab, UsersTab } from './tabs/admin';
+import { PrivacyTab } from './tabs/privacy';
 
 // Which tabs each role sees once logged in.
 const TABS = {
-  patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions', 'Refills'],
-  doctor: ['Appointments', 'My Prescriptions', 'Earnings', 'Profile'],
-  pharmacy: ['Inventory', 'Orders'],
-  admin: ['Overview', 'Reports', 'Approvals', 'Users', 'Orders', 'Appointments', 'Catalog', 'Content'],
+  patient: ['Medicines', 'Doctors', 'My Orders', 'My Appointments', 'Prescriptions', 'Refills', 'Privacy'],
+  doctor: ['Appointments', 'My Prescriptions', 'Earnings', 'Profile', 'Privacy'],
+  pharmacy: ['Inventory', 'Orders', 'Privacy'],
+  admin: ['Overview', 'Reports', 'Approvals', 'Users', 'Orders', 'Appointments', 'Catalog', 'Content', 'Retention'],
 };
 
 export default function App() {
@@ -48,6 +49,8 @@ export default function App() {
   };
 
   const goHome = () => { closeModal(); setActiveTab(null); };
+  // The Privacy tab clears the stored session itself; this resets the app back to logged-out.
+  const onErased = () => { setUser(null); setCart([]); setActiveTab(null); };
   const refresh = () => setReloadKey((k) => k + 1);
 
   return (
@@ -61,7 +64,7 @@ export default function App() {
         {user
           ? <Dashboard key={reloadKey} user={user} setUser={setUser} activeTab={activeTab}
                        setActiveTab={setActiveTab} cart={cart} setCart={setCart}
-                       config={config} refresh={refresh} />
+                       config={config} refresh={refresh} onErased={onErased} />
           : <Landing onNeedLogin={(what) => { toast(`Please log in to ${what}`); openModal(<LoginForm onLoggedIn={onAuthed} />); }} />}
       </main>
 
@@ -226,7 +229,7 @@ function CmsPage({ page }) {
 }
 
 /* ---------- Dashboard shell (logged in): tab bar + active tab ---------- */
-function Dashboard({ user, setUser, activeTab, setActiveTab, cart, setCart, config, refresh }) {
+function Dashboard({ user, setUser, activeTab, setActiveTab, cart, setCart, config, refresh, onErased }) {
   const tabs = TABS[user.role] || [];
   const current = activeTab && tabs.includes(activeTab) ? activeTab : tabs[0];
 
@@ -258,6 +261,8 @@ function Dashboard({ user, setUser, activeTab, setActiveTab, cart, setCart, conf
       case 'Users': return <UsersTab />;
       case 'Catalog': return <CatalogTab />;
       case 'Content': return <ContentTab />;
+      case 'Retention': return <RetentionTab />;
+      case 'Privacy': return <PrivacyTab user={user} onErased={onErased} />;
       default: return <Empty>Nothing here</Empty>;
     }
   };

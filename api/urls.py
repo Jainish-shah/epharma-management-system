@@ -11,6 +11,8 @@ urlpatterns = [
     path("register/send-otp", views.send_otp),
     path("register", views.register),
     path("me/documents", views.me_documents),
+    path("me/data", views.me_data),        # export everything we hold (right of access)
+    path("me/delete", views.me_delete),    # right to erasure
     path("me", views.me),
     path("login", views.login),
     path("logout", views.logout),
@@ -36,6 +38,7 @@ urlpatterns = [
     path("admin/stats", views.admin_stats),
     path("admin/reports", views.admin_reports),
     path("admin/audit", views.admin_audit),
+    path("admin/retention/purge", views.admin_retention),
     path("admin/taxonomy", views.admin_taxonomy),
     path("admin/taxonomy/<int:id>", views.admin_taxonomy_detail),
     path("admin/cms/<str:slug>", views.admin_cms),

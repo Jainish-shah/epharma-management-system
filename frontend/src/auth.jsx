@@ -50,13 +50,32 @@ const BLANK = {
   store_name: '', license_no: '', gstin: '',
 };
 
+/* Consent must be given actively: the box starts unticked and the server rejects a registration
+ * without it, so a pre-ticked box or a silent default is not possible. */
+function ConsentBox({ checked, onChange, onViewPolicy }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '14px 0 4px' }}>
+      <input id="regConsent" type="checkbox" checked={checked} onChange={onChange}
+             style={{ width: 'auto', marginTop: 3 }} />
+      <label htmlFor="regConsent" style={{ margin: 0, fontWeight: 400, color: 'var(--text)', fontSize: 13 }}>
+        I have read and accept the{' '}
+        <a href="#" onClick={(e) => { e.preventDefault(); onViewPolicy(); }} style={{ color: 'var(--primary-dark)' }}>
+          Privacy Policy
+        </a>
+        , and I consent to my personal and health data being processed to provide this service.
+      </label>
+    </div>
+  );
+}
+
 export function RegisterForm({ onRegistered }) {
-  const { closeModal, toast } = useUI();
+  const { closeModal, toast, openModal } = useUI();
   const [role, setRole] = useState('patient');
   const [f, setF] = useState(BLANK);
   const [otpHint, setOtpHint] = useState('');
   const [files, setFiles] = useState({});          // { label: File }
   const [specialties, setSpecialties] = useState([]);
+  const [consent, setConsent] = useState(false);   // must be ticked by the user, never pre-set
 
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const pickFile = (label) => (e) => setFiles({ ...files, [label]: e.target.files[0] });
@@ -90,7 +109,7 @@ export function RegisterForm({ onRegistered }) {
       }
       const data = await api('/api/register', {
         method: 'POST',
-        body: { role, ...f, documents: Object.keys(documents).length ? documents : undefined },
+        body: { role, ...f, consent, documents: Object.keys(documents).length ? documents : undefined },
       });
       onRegistered(data);
       toast(data.user.status === 'pending' ? 'Registered! Awaiting admin approval.' : 'Account created!');
@@ -168,10 +187,36 @@ export function RegisterForm({ onRegistered }) {
         </>
       )}
 
+      <ConsentBox
+        checked={consent}
+        onChange={(e) => setConsent(e.target.checked)}
+        onViewPolicy={async () => {
+          try {
+            const p = await api('/api/cms/privacy');
+            openModal(<PolicyView page={p} onBack={() => openModal(<RegisterForm onRegistered={onRegistered} />)} />);
+          } catch { toast('Could not load the privacy policy', true); }
+        }}
+      />
+
       <ModalActions>
         <button type="button" className="btn secondary" onClick={closeModal}>Cancel</button>
-        <button type="submit" className="btn">Register</button>
+        {/* disabled until consent is given, so the requirement is obvious before submitting */}
+        <button type="submit" className="btn" disabled={!consent}>Register</button>
       </ModalActions>
     </form>
+  );
+}
+
+function PolicyView({ page, onBack }) {
+  return (
+    <div>
+      <h2>{page.title}</h2>
+      <div style={{ whiteSpace: 'pre-wrap', fontSize: 14, lineHeight: 1.6, maxHeight: '60vh', overflowY: 'auto' }}>
+        {page.body}
+      </div>
+      <ModalActions>
+        <button className="btn secondary" onClick={onBack}>Back to registration</button>
+      </ModalActions>
+    </div>
   );
 }

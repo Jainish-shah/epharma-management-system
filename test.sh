@@ -95,23 +95,23 @@ NEWMAIL="newpatient@test.com"
 OTP=$(curl -s $J -d "{\"email\":\"$NEWMAIL\"}" $B/register/send-otp | jget '["devOtp"]')
 assert_eq "${#OTP}" "6" "send-otp returns 6-digit demo code"
 
-NOOTP=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\"}" $B/register | jget '["error"][:7]')
+NOOTP=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\",\"consent\":true}" $B/register | jget '["error"][:7]')
 assert_eq "$NOOTP" "Invalid" "patient register without OTP blocked"
 
-BADOTP=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\",\"otp\":\"000000\"}" $B/register | jget '["error"][:7]')
+BADOTP=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\",\"otp\":\"000000\",\"consent\":true}" $B/register | jget '["error"][:7]')
 assert_eq "$BADOTP" "Invalid" "patient register with wrong OTP blocked"
 
-REG=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\",\"otp\":\"$OTP\"}" $B/register | jget '["user"]["status"]')
+REG=$(curl -s $J -d "{\"role\":\"patient\",\"name\":\"New P\",\"email\":\"$NEWMAIL\",\"password\":\"secret1\",\"otp\":\"$OTP\",\"consent\":true}" $B/register | jget '["user"]["status"]')
 assert_eq "$REG" "approved" "patient register with valid OTP succeeds"
 
 # --- input validation ---
-SHORT=$(curl -s $J -d '{"role":"patient","name":"X","email":"x@y.com","password":"123"}' $B/register | jget '["error"][:8]')
+SHORT=$(curl -s $J -d '{"role":"patient","name":"X","email":"x@y.com","password":"123","consent":true}' $B/register | jget '["error"][:8]')
 assert_eq "$SHORT" "Password" "short password rejected"
 
-BADMAIL=$(curl -s $J -d '{"role":"patient","name":"X","email":"notanemail","password":"secret1"}' $B/register | jget '["error"]')
+BADMAIL=$(curl -s $J -d '{"role":"patient","name":"X","email":"notanemail","password":"secret1","consent":true}' $B/register | jget '["error"]')
 assert_eq "$BADMAIL" "A valid email is required" "invalid email rejected"
 
-DOCREQ=$(curl -s $J -d '{"role":"doctor","name":"Dr X","email":"drx@test.com","password":"secret1"}' $B/register | jget '["error"][:7]')
+DOCREQ=$(curl -s $J -d '{"role":"doctor","name":"Dr X","email":"drx@test.com","password":"secret1","consent":true}' $B/register | jget '["error"][:7]')
 assert_eq "$DOCREQ" "Doctors" "doctor missing qualification rejected"
 
 BADPRICE=$(curl -s $J -H "Authorization: Bearer $PH" -d '{"name":"Test Med","category":"Test","price":-5}' $B/medicines | jget '["error"][:5]')
@@ -224,6 +224,55 @@ assert_eq "$AUD" "True" "audit log records login and order events"
 
 PTAUD=$(curl -s -H "Authorization: Bearer $PT" $B/admin/audit | jget '["error"]')
 assert_eq "$PTAUD" "Not allowed for your role" "non-admin blocked from the audit log"
+
+# ============ Phase 7: consent, subject rights, retention, key rotation ============
+
+# --- consent is mandatory and recorded ---
+NOCONSENT=$(curl -s $J -d '{"role":"patient","name":"NC","email":"nc@test.com","password":"secret1","otp":"1"}' $B/register | jget '["error"][:8]')
+assert_eq "$NOCONSENT" "You must" "registration without consent rejected"
+
+CV=$(curl -s -H "Authorization: Bearer $PT" $B/me | jget '["consent_version"]')
+assert_eq "$([ "$CV" != "None" ] && echo recorded || echo missing)" "recorded" "consent version stored on the account"
+
+CONSENTLOG=$(curl -s -H "Authorization: Bearer $AD" $B/admin/audit | python3 -c "import sys,json;print(any(a['action']=='consent.granted' for a in json.load(sys.stdin)))")
+assert_eq "$CONSENTLOG" "True" "consent recorded in the audit trail"
+
+# --- right of access: export returns the person's own data, decrypted ---
+EXPORT=$(curl -s -H "Authorization: Bearer $PT" $B/me/data)
+assert_eq "$(echo "$EXPORT" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(all(k in d for k in ("account","orders","prescriptions","appointments")))')" "True" "data export contains all record types"
+assert_eq "$(echo "$EXPORT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["prescriptions"][0]["content"])')" "Rx test" "exported prescription is decrypted"
+assert_eq "$(echo "$EXPORT" | python3 -c 'import sys,json;print("password_hash" in json.load(sys.stdin)["account"])')" "False" "export never includes the password hash"
+
+EXPDENY=$(curl -s $B/me/data | jget '["error"]')
+assert_eq "$EXPDENY" "Please log in" "anonymous cannot export data"
+
+# --- retention purge ---
+PURGE=$(curl -s -X POST $J -H "Authorization: Bearer $AD" $B/admin/retention/purge)
+assert_eq "$(echo "$PURGE" | python3 -c 'import sys,json;print("otps" in json.load(sys.stdin)["removed"])')" "True" "retention purge reports what it removed"
+PURGEDENY=$(curl -s -X POST $J -H "Authorization: Bearer $PT" $B/admin/retention/purge | jget '["error"]')
+assert_eq "$PURGEDENY" "Not allowed for your role" "non-admin blocked from retention purge"
+
+# --- right to erasure (run last: it destroys this patient's identity) ---
+NOPW=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"password":"wrong"}' $B/me/delete | jget '["error"][:8]')
+assert_eq "$NOPW" "Password" "erasure requires password confirmation"
+
+ADMINDEL=$(curl -s $J -H "Authorization: Bearer $AD" -d '{"password":"admin123"}' $B/me/delete | jget '["error"][:13]')
+assert_eq "$ADMINDEL" "Administrator" "admin accounts cannot self-erase"
+
+ERASED=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"password":"patient123"}' $B/me/delete | jget '["erased"]')
+assert_eq "$ERASED" "True" "account erased on request"
+
+RELOGIN=$(curl -s $J -d '{"email":"priya@gmail.com","password":"patient123"}' $B/login | jget '["error"]')
+assert_eq "$RELOGIN" "Invalid email or password" "erased account can no longer log in"
+
+SESSIONDEAD=$(curl -s -H "Authorization: Bearer $PT" $B/me | jget '["error"]')
+assert_eq "$SESSIONDEAD" "Please log in" "erasure ends existing sessions"
+
+# the order survives (statutory retention) but no longer identifies anyone
+KEPT=$(curl -s -H "Authorization: Bearer $AD" $B/admin/stats | jget '["orders"]')
+assert_eq "$KEPT" "1" "order records retained after erasure"
+ANON=$(curl -s -H "Authorization: Bearer $AD" "$B/admin/users" | python3 -c "import sys,json;print(any(u['name']=='Erased user' for u in json.load(sys.stdin)))")
+assert_eq "$ANON" "True" "erased account is anonymised, not deleted"
 
 echo ""
 echo "ALL TESTS PASSED"

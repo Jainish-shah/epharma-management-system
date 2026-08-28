@@ -42,7 +42,8 @@ Run Django and `npm run dev` side by side while developing; run the build before
 | `frontend/src/tabs/patient.jsx` | Medicines, cart & checkout, doctors & booking, refills |
 | `frontend/src/tabs/shared.jsx` | Orders, appointments, teleconsultation, prescriptions |
 | `frontend/src/tabs/provider.jsx` | Doctor earnings/profile, pharmacy inventory |
-| `frontend/src/tabs/admin.jsx` | Overview, reports, approvals, users, catalog, CMS |
+| `frontend/src/tabs/admin.jsx` | Overview, reports, approvals, users, catalog, CMS, retention |
+| `frontend/src/tabs/privacy.jsx` | Consent record, data download, account erasure |
 
 ## Test
 
@@ -50,10 +51,10 @@ Run Django and `npm run dev` side by side while developing; run the build before
 bash test.sh
 ```
 
-End-to-end API suite (45 assertions): full patient → pharmacy → doctor → admin workflow,
+End-to-end API suite (65 assertions): full patient → pharmacy → doctor → admin workflow,
 OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
 payment signature verification, teleconsultation chat, refill reminders, admin reports,
-taxonomy management, and CMS editing. Uses a throwaway database — never touches demo data.
+taxonomy management, CMS editing, consent enforcement, data export, erasure and retention. Uses a throwaway database — never touches demo data.
 See [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
 for the analysis document and development plan, and
 [docs/coding-standards.md](docs/coding-standards.md) for the project coding standards.
@@ -114,11 +115,11 @@ for the analysis document and development plan, and
 - **Payments (Stripe / Razorpay)** — provider-neutral checkout: a payment intent is created for the cart,
   then the order is placed only after the server verifies the payment and that the paid amount matches the
   recomputed cart total. Both providers ship a built-in mock (fully testable); pick one with
-  `PAYMENT_PROVIDER` (default `stripe`) and go live by setting real keys — see [payments.js](payments.js).
+  `PAYMENT_PROVIDER` (default `stripe`) and go live by setting real keys — see [api/payments.py](api/payments.py).
 - **Event streaming (Kafka)** — orders, payments and notifications are published to topics and handled by
   independent consumers (notification service persists messages; payment service issues receipts), so
   producers are decoupled from consumers. Runs on an in-process bus by default; set `KAFKA_BROKERS` to
-  stream through Apache Kafka (see [events.js](events.js), [docker-compose.yml](docker-compose.yml)).
+  stream through Apache Kafka (see [api/events.py](api/events.py), [docker-compose.yml](docker-compose.yml)).
 - **Teleconsultation** — per-appointment chat (backed by the `messages` table, live-polled in the UI)
   and a deterministic, unguessable Jitsi video room per appointment. Opens once the appointment is confirmed;
   only the two parties can access it.
@@ -153,6 +154,22 @@ for the analysis document and development plan, and
   content, `role="dialog"` + focus management + Escape-to-close on modals, `alt` text on all images,
   and `prefers-reduced-motion` support.
 
+
+### Phase 7 additions (compliance & data governance)
+
+- **Consent capture** — registration requires explicit, unticked-by-default consent; the accepted
+  privacy-policy version and timestamp are stored on the account and recorded in the audit trail.
+- **Right of access / portability** — `GET /api/me/data` returns everything held about the caller,
+  decrypted, and the Privacy tab downloads it as a JSON file.
+- **Right to erasure** — `DELETE /api/me/delete` overwrites every identifying field, disables the
+  login and ends all sessions. Orders, payments and prescriptions are *retained in de-identified
+  form*, because pharmacies are normally required to keep them; the reasoning and the single place
+  to change it are in [api/compliance.py](api/compliance.py).
+- **Data retention** — configurable windows per record type, purged by `POST /api/admin/retention/purge`
+  (intended for a nightly job) and visible to admins in the Retention tab.
+- **Encryption-key rotation** — `EPHARMA_ENC_KEY_OLD` lets a retired key still decrypt while the new
+  key encrypts; `python manage.py rotate_encryption_key` re-encrypts existing rows.
+
 ## API overview
 
 | Area | Endpoints |
@@ -160,6 +177,8 @@ for the analysis document and development plan, and
 | Payments | `POST /api/payments/create` (patient — payment intent for the cart) |
 | Consultation | `GET/POST /api/appointments/:id/messages`, `GET /api/appointments/:id/room` (patient/doctor party only) |
 | Refills | `GET /api/refills` (patient) |
+| Privacy (self-service) | `GET /api/me/data` (export), `DELETE /api/me/delete` (erasure) |
+| Retention | `POST /api/admin/retention/purge` (admin) |
 | Config (public) | `GET /api/config` (active payment provider) |
 | Reports | `GET /api/admin/reports` (admin) |
 | Catalog | `GET /api/taxonomy?type=`, `POST/DELETE /api/admin/taxonomy[/:id]` (admin write) |
@@ -190,6 +209,9 @@ All optional — the app runs with sensible defaults and no configuration.
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | mock | live Razorpay keys (else mock provider) |
 | `KAFKA_BROKERS` | _(unset)_ | e.g. `localhost:9092` — stream events through Kafka instead of the in-process bus |
 | `NOTIFY_CHANNELS` | `log` | notification delivery channels: `log`, `email`, `sms` (comma-separated) |
+| `EPHARMA_ENC_KEY_OLD` | _(unset)_ | comma-separated retired keys, kept only while re-encrypting after a key rotation |
+| `POLICY_VERSION` | `1.0` | privacy-policy version recorded against each consent |
+| `RETAIN_OTPS_DAYS` / `RETAIN_TOKENS_DAYS` / `RETAIN_NOTIFICATIONS_DAYS` / `RETAIN_AUDIT_DAYS` | `1` / `30` / `180` / `365` | data-retention windows |
 | `REFILL_DAYS` | `30` | days after an order before a refill reminder is due |
 | `DATABASE_URL` | _(unset)_ | `postgres://user:pass@host/db` — run on PostgreSQL instead of SQLite |
 | `EPHARMA_ENC_KEY` | demo key | secret used to encrypt medical records at rest — **set this in production** |

@@ -11,9 +11,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
+from datetime import datetime, timezone
 
 from . import crypto  # encryption at rest for sensitive columns
 
@@ -87,14 +89,20 @@ def run(sql, params=()):
 
 
 def execute(script):
-    """Run a multi-statement SQL script (used once to create the schema)."""
+    """Run a multi-statement SQL script (used once to create the schema).
+
+    psycopg sends one statement at a time, so the script is split on ';'. Comments are stripped
+    first: a ';' inside a '--' comment would otherwise split a statement in half. (The schema has no
+    string literal containing '--', so removing from '--' to end of line is safe here.)
+    """
     with _lock:
         if IS_PG:
-            for stmt in script.split(";"):
+            cleaned = "\n".join(re.sub(r"--.*$", "", line) for line in script.split("\n"))
+            for stmt in cleaned.split(";"):
                 if stmt.strip():
                     _conn.execute(stmt)
         else:
-            _conn.executescript(script)
+            _conn.executescript(script)  # SQLite handles comments and multiple statements itself
 
 
 # Wrap a block of writes so they all succeed together or none do:
@@ -148,10 +156,16 @@ CREATE TABLE IF NOT EXISTS users (
   status TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending','approved','rejected')),
   specialization TEXT, qualification TEXT, fee INTEGER, availability TEXT,
   store_name TEXT, license_no TEXT, gstin TEXT, address TEXT, documents TEXT,
+  -- Phase 7 (compliance): which privacy-policy version the user accepted, and when.
+  consent_version TEXT, consent_at TEXT,
+  -- Set when the account has been erased on request; personal fields are overwritten, while
+  -- de-identified medical and order records are kept for the legally required retention period.
+  anonymised_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS tokens (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL REFERENCES users(id)
+  id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))   -- lets stale sessions be purged (Phase 7)
 );
 CREATE TABLE IF NOT EXISTS medicines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,9 +264,35 @@ def _pg_schema(s):
              .replace("REAL", "DOUBLE PRECISION"))
 
 
+def _columns(table):
+    if IS_PG:
+        rows = query("SELECT column_name AS name FROM information_schema.columns WHERE table_name = ?", (table,))
+    else:
+        rows = query(f"PRAGMA table_info({table})")
+    return {r["name"] for r in rows}
+
+
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS does not alter an existing
+# table, so a database created by an earlier version needs them added — additively, never dropping
+# or rewriting anything, so upgrading cannot lose data.
+_ADDED_COLUMNS = [
+    ("users", "consent_version", "TEXT"),
+    ("users", "consent_at", "TEXT"),
+    ("users", "anonymised_at", "TEXT"),
+    ("tokens", "created_at", "TEXT"),
+]
+
+
+def _migrate():
+    for table, column, coltype in _ADDED_COLUMNS:
+        if column not in _columns(table):
+            run(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def init_and_seed():
-    """Create the tables (no-op if they already exist), then load demo data — but only on a fresh
-    database. An existing database is left untouched, so restarts never wipe data.
+    """Create the tables (no-op if they already exist), apply additive migrations, then load demo
+    data — but only on a fresh database. An existing database is left untouched, so restarts never
+    wipe data.
 
     Safe to call from several processes at once: production runs multiple server workers, and they
     all boot simultaneously. The check-and-seed happens inside one transaction (with the write lock
@@ -266,6 +306,7 @@ def init_and_seed():
         _conn.execute("SELECT pg_advisory_lock(%s)", (_INIT_LOCK_ID,))
     try:
         execute(_pg_schema(SCHEMA) if IS_PG else SCHEMA)
+        _migrate()
         try:
             with transaction(immediate=True):
                 if get("SELECT COUNT(*) AS c FROM users")["c"] != 0:
@@ -283,13 +324,20 @@ def init_and_seed():
 def _seed_demo_data():
     """Insert the demo users, catalog, taxonomy and CMS pages. Called once, on a fresh database."""
 
+    # Demo accounts are created as though they had accepted the current privacy policy, so the
+    # seeded data matches what a real registration produces.
+    from . import compliance
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     def add_user(**u):
         cols = ["role", "name", "email", "phone", "password_hash", "status", "specialization",
-                "qualification", "fee", "availability", "store_name", "license_no", "gstin", "address"]
+                "qualification", "fee", "availability", "store_name", "license_no", "gstin", "address",
+                "consent_version", "consent_at"]
         vals = [u.get("role"), u.get("name"), u.get("email"), u.get("phone"),
                 hash_password(u["password"]), u.get("status", "approved"),
                 u.get("specialization"), u.get("qualification"), u.get("fee"), u.get("availability"),
-                u.get("store_name"), u.get("license_no"), u.get("gstin"), u.get("address")]
+                u.get("store_name"), u.get("license_no"), u.get("gstin"), u.get("address"),
+                compliance.POLICY_VERSION, now]
         return run(f"INSERT INTO users ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
 
     add_user(role="admin", name="System Admin", email="admin@epharma.com", password="admin123")
@@ -367,9 +415,12 @@ def _seed_demo_data():
 
 
 def issue_token(user_id):
-    """Create a fresh random session token for a user and store it (login/register call this)."""
+    """Create a fresh random session token for a user and store it (login/register call this).
+    created_at is set explicitly rather than by a column default, because the column is added by
+    migration on databases that predate it and so carries no default there."""
     token = secrets.token_hex(24)
-    run("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, user_id))
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    run("INSERT INTO tokens (token, user_id, created_at) VALUES (?, ?, ?)", (token, user_id, now))
     return token
 
 
