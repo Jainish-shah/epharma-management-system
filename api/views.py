@@ -30,7 +30,7 @@ from decimal import Decimal
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from . import db, payments, events, crypto, compliance
+from . import db, payments, events, crypto, compliance, billing
 
 
 def _now():
@@ -127,7 +127,10 @@ events.subscribe(TOPICS["NOTIFICATIONS"], lambda e: db.run(
 # Consumer — payments: when a payment succeeds, send the patient a receipt notification.
 def _on_payment(e):
     print(f"[payments] order #{e['orderId']} paid: ₹{e['amount'] / 100:.2f}")
-    notify(e["patientId"], f"Payment received: ₹{e['amount'] / 100:.2f} for order #{e['orderId']}")
+    # The receipt doubles as the invoice notice, so the patient is told the tax-invoice number the
+    # moment the payment clears rather than having to go looking for it.
+    invoice = f" · tax invoice {e['invoiceNo']}" if e.get("invoiceNo") else ""
+    notify(e["patientId"], f"Payment received: ₹{e['amount'] / 100:.2f} for order #{e['orderId']}{invoice}")
 
 
 events.subscribe(TOPICS["PAYMENTS"], _on_payment)
@@ -420,6 +423,19 @@ def me(request):
     return J(db.public_user(user))
 
 
+# ==================== stock ledger (Phase 8) ====================
+# Every path that changes a stock level goes through here, so the ledger can never disagree with
+# the medicines table: a sale, a restock and a manual correction are all just moves with different
+# reasons. Callers that already hold a transaction (order placement) get their move committed with
+# the rest of the order.
+STOCK_REASONS = ("restock", "adjustment", "damage", "expiry", "return")
+
+
+def log_stock(medicine_id, pharmacy_id, delta, balance, reason, actor_id):
+    db.run("INSERT INTO stock_moves (medicine_id, pharmacy_id, delta, balance, reason, actor_id) "
+           "VALUES (?, ?, ?, ?, ?, ?)", (medicine_id, pharmacy_id, delta, balance, reason, actor_id))
+
+
 # ==================== catalog & pharmacy inventory ====================
 @api
 def medicines(request):
@@ -436,8 +452,12 @@ def medicines(request):
             return J({"error": "Price must be a non-negative number"}, 400)
         if b.get("stock") not in (None, "") and not non_neg_num(b.get("stock")):
             return J({"error": "Stock must be a non-negative number"}, 400)
-        mid = db.run("INSERT INTO medicines (pharmacy_id, name, category, price, stock) VALUES (?, ?, ?, ?, ?)",
-                     (user["id"], b["name"], b["category"], float(b["price"]), int(float(b.get("stock") or 0))))
+        opening = int(float(b.get("stock") or 0))
+        mid = db.run("INSERT INTO medicines (pharmacy_id, name, category, price, stock, gst_rate) "
+                     "VALUES (?, ?, ?, ?, ?, ?)",
+                     (user["id"], b["name"], b["category"], float(b["price"]), opening,
+                      float(b.get("gst_rate") or 5)))
+        log_stock(mid, user["id"], opening, opening, "opening", user["id"])
         return J(db.get("SELECT * FROM medicines WHERE id = ?", (mid,)))
     search = f"%{request.GET.get('search', '')}%"  # LIKE pattern; empty search matches everything
     return J(db.query(
@@ -464,11 +484,52 @@ def medicine_detail(request, id):
     if not med:
         return J({"error": "Medicine not found"}, 404)
     if request.method == "DELETE":
+        # The ledger rows reference this medicine, so they go with it (foreign keys are enforced).
+        db.run("DELETE FROM stock_moves WHERE medicine_id = ?", (id,))
         db.run("DELETE FROM medicines WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
         return J({"ok": True})
     m = {**med, **request.data}  # start from the existing row, overlay any provided fields
-    db.run("UPDATE medicines SET name = ?, category = ?, price = ?, stock = ? WHERE id = ?",
-           (m["name"], m["category"], float(m["price"]), int(float(m["stock"])), med["id"]))
+    stock = int(float(m["stock"]))
+    db.run("UPDATE medicines SET name = ?, category = ?, price = ?, stock = ?, gst_rate = ? WHERE id = ?",
+           (m["name"], m["category"], float(m["price"]), stock, float(m.get("gst_rate") or 5), med["id"]))
+    if stock != med["stock"]:
+        # Typing a new number straight into the edit form is still a stock movement — record it as a
+        # correction rather than letting the level change with no explanation behind it.
+        log_stock(med["id"], user["id"], stock - med["stock"], stock, "adjustment", user["id"])
+    return J(db.get("SELECT * FROM medicines WHERE id = ?", (med["id"],)))
+
+
+@auth("pharmacy")
+def medicine_stock(request, id):
+    """GET /api/medicines/<id>/stock — the movement history for one medicine.
+    POST /api/medicines/<id>/stock — book stock in or out ({delta, reason}).
+
+    This is the proper way to restock: it states how many units moved and why, instead of
+    overwriting the level and losing the reason."""
+    user = request.user
+    med = db.get("SELECT * FROM medicines WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
+    if not med:
+        return J({"error": "Medicine not found"}, 404)
+    if request.method == "GET":
+        return J(db.query(
+            "SELECT s.*, u.name AS actor_name FROM stock_moves s LEFT JOIN users u ON u.id = s.actor_id "
+            "WHERE s.medicine_id = ? ORDER BY s.id DESC", (id,)))
+    try:
+        delta = int(float(request.data.get("delta")))
+    except (TypeError, ValueError):
+        return J({"error": "Quantity must be a whole number"}, 400)
+    if delta == 0:
+        return J({"error": "Quantity must not be zero"}, 400)
+    reason = request.data.get("reason") or "restock"
+    if reason not in STOCK_REASONS:
+        return J({"error": "Unknown reason"}, 400)
+    balance = med["stock"] + delta
+    if balance < 0:  # a write-off cannot take more units than are on the shelf
+        return J({"error": f"Only {med['stock']} in stock"}, 400)
+    with db.transaction():  # level and ledger move together or not at all
+        db.run("UPDATE medicines SET stock = ? WHERE id = ?", (balance, med["id"]))
+        log_stock(med["id"], user["id"], delta, balance, reason, user["id"])
+    db.audit(user, "stock.move", f"{med['name']} {delta:+d} ({reason})")
     return J(db.get("SELECT * FROM medicines WHERE id = ?", (med["id"],)))
 
 
@@ -594,20 +655,28 @@ def _create_order(request):
         if prescription:
             prescription_id = db.run("INSERT INTO prescriptions (patient_id, kind, content) VALUES (?, 'uploaded', ?)",
                                      (user["id"], crypto.encrypt(prescription)))
-        oid = db.run("INSERT INTO orders (patient_id, pharmacy_id, type, address, total, prescription_id) "
-                     "VALUES (?, ?, ?, ?, ?, ?)",
+        # The tax invoice is raised here, inside the same transaction: the payment is already
+        # verified, so this order is a completed supply and needs a number. Numbering here also
+        # means a rollback un-reserves the serial, keeping the pharmacy's series free of gaps.
+        invoice_no = billing.next_invoice_no(pharmacy_id)
+        oid = db.run("INSERT INTO orders (patient_id, pharmacy_id, type, address, total, prescription_id, "
+                     "invoice_no, invoice_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                      (user["id"], pharmacy_id, "pickup" if otype == "pickup" else "delivery",
-                      address or None, total, prescription_id))
+                      address or None, total, prescription_id, invoice_no, _now()))
         for med, qty in lines:
-            db.run("INSERT INTO order_items (order_id, medicine_id, name, price, qty) VALUES (?, ?, ?, ?, ?)",
-                   (oid, med["id"], med["name"], med["price"], qty))
+            db.run("INSERT INTO order_items (order_id, medicine_id, name, price, qty, gst_rate) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (oid, med["id"], med["name"], med["price"], qty, med["gst_rate"]))
+            # price_cart already took the stock; record WHY it moved (med["stock"] is the pre-sale level)
+            log_stock(med["id"], pharmacy_id, -qty, med["stock"] - qty, "sale", user["id"])
             # schedule a refill reminder REFILL_DAYS from now for each medicine bought
             db.run("INSERT INTO refill_reminders (patient_id, medicine_name, due_date) VALUES (?, ?, ?)",
                    (user["id"], med["name"], _plus_days(REFILL_DAYS)))
         db.run("UPDATE payments SET status = 'paid', order_id = ? WHERE id = ?", (oid, pay["id"]))
         # step 4: announce what happened; consumers turn these into logs, receipts, notifications
         events.publish(TOPICS["ORDERS"], {"orderId": oid, "pharmacyId": pharmacy_id, "patientId": user["id"], "total": total})
-        events.publish(TOPICS["PAYMENTS"], {"orderId": oid, "patientId": user["id"], "amount": pay["amount"]})
+        events.publish(TOPICS["PAYMENTS"], {"orderId": oid, "patientId": user["id"], "amount": pay["amount"],
+                                            "invoiceNo": invoice_no})
         notify(pharmacy_id, f"New order #{oid} received (₹{total:.2f})")
         return oid
 
@@ -633,9 +702,62 @@ def order_detail(request, id):
         nxt = "shipped" if order["type"] == "delivery" else "ready"
     if not nxt:
         return J({"error": "Order is already complete"}, 400)
+    if nxt == "shipped" and not order["delivery_mode"]:
+        # Nothing can leave the store unassigned — otherwise the patient is told their order shipped
+        # and nobody, including the pharmacy, can say who has it.
+        return J({"error": "Assign a rider or courier before marking this order shipped"}, 400)
     db.run("UPDATE orders SET status = ? WHERE id = ?", (nxt, order["id"]))
     notify(order["patient_id"], f"Order #{order['id']} is now {nxt.replace('_', ' ')}")
     return J(db.get("SELECT * FROM orders WHERE id = ?", (order["id"],)))
+
+
+@auth("pharmacy")
+def order_delivery(request, id):
+    """POST /api/orders/<id>/delivery — pharmacy assigns the order to its own rider or to a
+    partner courier. Handing an order to a carrier is a distinct decision from advancing its
+    status, so it is a distinct endpoint; PATCH keeps meaning 'move to the next step'."""
+    user = request.user
+    order = db.get("SELECT * FROM orders WHERE id = ? AND pharmacy_id = ?", (id, user["id"]))
+    if not order:
+        return J({"error": "Order not found"}, 404)
+    if order["type"] != "delivery":
+        return J({"error": "Pickup orders are collected in store"}, 400)
+    b = request.data
+    mode = b.get("delivery_mode")
+    if mode not in ("own", "partner"):
+        return J({"error": "Choose own rider or partner courier"}, 400)
+    name = (b.get("courier_name") or "").strip()
+    if not name:
+        return J({"error": "Rider or courier name is required"}, 400)
+    phone, tracking = (b.get("rider_phone") or "").strip(), (b.get("tracking_no") or "").strip()
+    if mode == "own" and (not phone or not is_phone(phone)):
+        return J({"error": "Enter a valid rider contact number"}, 400)
+    if mode == "partner" and not tracking:
+        return J({"error": "Courier tracking number is required"}, 400)
+    db.run("UPDATE orders SET delivery_mode = ?, courier_name = ?, rider_phone = ?, tracking_no = ? WHERE id = ?",
+           (mode, name, phone or None, tracking or None, order["id"]))
+    who = f"{name} ({phone})" if mode == "own" else f"{name}, tracking {tracking}"
+    notify(order["patient_id"], f"Order #{order['id']} is out with {who}")
+    db.audit(user, "order.assigned", f"order #{order['id']} -> {mode}: {who}")
+    return J(db.get("SELECT * FROM orders WHERE id = ?", (order["id"],)))
+
+
+@api
+def order_invoice(request, id):
+    """GET /api/orders/<id>/invoice — the GST tax invoice for an order.
+    Readable by the patient who placed it, the pharmacy that filled it, and admins."""
+    user, err = require_auth(request)
+    if err:
+        return err
+    order = db.get("SELECT * FROM orders WHERE id = ?", (id,))
+    if not order or (user["role"] == "patient" and order["patient_id"] != user["id"]) \
+            or (user["role"] == "pharmacy" and order["pharmacy_id"] != user["id"]) \
+            or user["role"] == "doctor":
+        return J({"error": "Order not found"}, 404)
+    invoice = billing.build_invoice(order)
+    if not invoice:
+        return J({"error": "No invoice was raised for this order"}, 404)
+    return J(invoice)
 
 
 # ==================== appointments ====================

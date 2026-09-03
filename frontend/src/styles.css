@@ -194,3 +194,30 @@ tr:last-child td { border-bottom: none; }
 .rx-img { max-width: 200px; border-radius: 8px; border: 1px solid var(--border); display: block; }
 .slot-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .demo-creds { font-size: 12px; color: var(--muted); margin-top: 12px; line-height: 1.7; background: var(--bg); border-radius: 8px; padding: 10px; }
+
+/* ---------- GST tax invoice (Phase 8) ---------- */
+.invoice-sheet { font-size: 13px; color: #111827; background: #fff; }
+/* An eight-column tax invoice does not fit the standard dialog width; nor does the stock ledger,
+   whose last column is a person's full name. */
+.modal:has(.invoice-sheet) { max-width: 720px; }
+.modal:has(.stock-dialog) { max-width: 620px; }
+.invoice-sheet h2 { margin: 0 0 2px; }
+.invoice-sheet .inv-head { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.invoice-sheet .inv-parties { display: flex; gap: 16px; flex-wrap: wrap; margin: 14px 0; }
+.invoice-sheet .inv-parties > div { flex: 1 1 200px; border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.invoice-sheet table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.invoice-sheet th, .invoice-sheet td { border: 1px solid var(--border); padding: 6px 8px; text-align: right; }
+.invoice-sheet th:first-child, .invoice-sheet td:first-child { text-align: left; }
+.invoice-sheet tfoot td { font-weight: 700; }
+.invoice-sheet .inv-note { color: var(--muted); font-size: 11px; margin-top: 12px; line-height: 1.6; }
+
+/* Printing an invoice prints only the invoice: everything else is hidden and the sheet is
+   promoted to the top of the page. Native browser print -> PDF, so no PDF library is needed. */
+@media print {
+  /* the sideways-scroll wrapper must not clip the table on paper */
+  .invoice-sheet .table-wrap { overflow: visible; border: none; }
+  body * { visibility: hidden; }
+  .invoice-sheet, .invoice-sheet * { visibility: visible; }
+  .invoice-sheet { position: absolute; inset: 0; width: 100%; padding: 0; }
+  .invoice-sheet .no-print { display: none; }
+}

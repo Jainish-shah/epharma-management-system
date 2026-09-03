@@ -56,6 +56,10 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | Role checks in one `require_auth(*roles)` helper | RBAC enforced at the view boundary, single point of audit |
 | Event bus abstraction (in-process default, Kafka opt-in) | Decouples producers (orders/payments) from consumers (notifications/receipts); scales to multiple instances via Kafka without changing business logic |
 | Payment-provider façade (Stripe / Razorpay) | Uniform verified-checkout flow; provider is a config switch, mock providers keep it fully testable |
+| Invoice serials from a per-pharmacy counter row, not the order id | GST requires a series that is consecutive per supplier and unique per financial year; the global order id would leave holes in each pharmacy's series |
+| Price *and* GST rate snapshotted onto `order_items` | An issued tax invoice is a historical document — editing the catalogue must never rewrite it |
+| Invoice rendered as HTML, printed to PDF by the browser | A statutory document with no PDF dependency to license, patch or keep alive |
+| Stock levels backed by an append-only movement ledger | The current level is derivable and explainable: every unit on the shelf traces to a movement with a reason and an actor |
 
 ## 3. Core Module Analysis
 
@@ -78,6 +82,9 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 - Store profile with drug license and GSTIN (verified by admin).
 - Inventory CRUD with stock tracking and low-stock warnings.
 - Order pipeline with type-aware transitions: pending → preparing → shipped → delivered (delivery) or ready → picked up (pickup). Stock is validated and decremented atomically inside a DB transaction at order time.
+- **Delivery assignment (Phase 8):** each delivery order is handed to the store's own rider or to a partner courier before it can be marked shipped; the patient sees the carrier and tracking reference.
+- **Stock in/out ledger (Phase 8):** restocks, returns and write-offs are booked with a reason rather than by overwriting the level, and every movement records the balance it produced.
+- **GST invoicing (Phase 8):** every paid order raises a tax invoice on the store's own serial series, printable to PDF.
 
 ### 3.5 Admin Dashboard (ERP)
 - KPI overview: users by role, pending approvals, order count, revenue, appointments.
@@ -91,8 +98,8 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | `users` | role, email (unique), password_hash, status, role-specific columns, consent_version/consent_at, anonymised_at | Single-table design; `status` drives approval flow; consent and erasure recorded here (Phase 7) |
 | `tokens` | token → user_id, created_at | Session store; `created_at` lets idle sessions be purged |
 | `medicines` | pharmacy_id, name, category, price, stock | Per-pharmacy inventory |
-| `orders` | patient_id, pharmacy_id, status, type, total, prescription_id | Total computed server-side |
-| `order_items` | order_id, medicine_id, name, price, qty | Price snapshotted at purchase |
+| `orders` | patient_id, pharmacy_id, status, type, total, prescription_id, invoice_no/invoice_at, delivery_mode/courier_name/rider_phone/tracking_no | Total computed server-side; invoice raised at order time; carrier recorded before dispatch (Phase 8) |
+| `order_items` | order_id, medicine_id, name, price, qty, gst_rate | Price **and tax rate** snapshotted at purchase, so an issued invoice never changes |
 | `appointments` | patient_id, doctor_id, slot, status | |
 | `prescriptions` | patient_id, doctor_id, appointment_id, kind, content | `uploaded` (patient) or `eprescription` (doctor) |
 | `notifications` | user_id, message, read | Feeds every status change |
@@ -101,7 +108,9 @@ An integrated ERP platform connecting **patients**, **doctors**, and **medical s
 | `refill_reminders` | patient_id, medicine_name, due_date, notified | Materialised into notifications when due |
 | `taxonomy` | type (category/specialty), name | Admin-managed lists; advisory `<datalist>` suggestions |
 | `cms_pages` | slug, title, body | Admin-editable FAQ / Terms / Privacy |
-| `audit_log` | user_id, actor, action, detail | Security trail: logins, approvals, orders, prescriptions, consent, erasure |
+| `audit_log` | user_id, actor, action, detail | Security trail: logins, approvals, orders, prescriptions, consent, erasure, stock movements |
+| `stock_moves` | medicine_id, pharmacy_id, delta, balance, reason, actor_id | Append-only stock ledger: opening, sale, restock, return, damage, expiry, adjustment (Phase 8) |
+| `invoice_seq` | pharmacy_id, fy, last_no | Per-supplier, per-financial-year invoice counter; the row lock serialises concurrent checkouts (Phase 8) |
 
 ## 5. API Architecture
 
@@ -118,6 +127,7 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 - **Subject rights (Phase 7):** each person can export everything held about them and request erasure; erasure overwrites identifying fields while retaining de-identified medical/financial records for their statutory period.
 - **Retention (Phase 7):** per-record-type windows, purged on a schedule.
 - **Key rotation (Phase 7):** a retired key can still decrypt while the new key encrypts, with a command to re-encrypt existing rows.
+- **Financial record integrity (Phase 8):** invoice serials come from a locked counter (never reused, never gapped) and every invoice line is a snapshot, so a customer's tax document cannot be altered after issue by editing the catalogue.
 
 ## 7. Development Plan (13 July – 17 September 2026)
 
@@ -128,11 +138,22 @@ RESTful JSON over ~20 endpoints in six groups: auth, public catalog, inventory (
 | 3. Commerce & consultation | 3–16 Aug | Payment-gateway integration (Razorpay sandbox, signature-verified), teleconsultation chat + Jitsi video, refill reminders | ✅ Done |
 | 4. Admin ERP & reporting | 17–30 Aug | Revenue/consultation/order reports, CMS pages, SMS/email gateway (Kafka consumer), category & specialty management | ✅ Done |
 | 5. Performance & security | 31 Aug – 13 Sep | PostgreSQL support (dual-backend data layer), encryption at rest, audit logging, load testing, accessibility pass | ✅ Done |
-| 6. Deployment & handover | 14–17 Sep | Production deployment, final documentation, demo & handover | Planned |
+| 6. Deployment & handover | 14–17 Sep | Production deployment, final documentation, demo & handover | In progress |
+
+Delivered week by week, the phases above map onto these working increments:
+
+| Week | Dates | Increment | Status |
+|---|---|---|---|
+| Phase 5 | 10–16 Aug | PostgreSQL, encryption at rest, audit log, load & accessibility testing | ✅ Done |
+| Phase 6 | 17–23 Aug | Production deployment package (Docker, gunicorn, smoke tests) + React rewrite | ✅ Done |
+| Phase 7 | 24–30 Aug | Compliance & data governance (consent, access, erasure, retention, key rotation) | ✅ Done |
+| Phase 8 | 31 Aug – 6 Sep | Fulfilment & billing (GST invoices, delivery assignment, stock ledger) | ✅ Done |
+| Phase 9 | 7–13 Sep | Remaining workflow items and final hardening | Planned |
+| Phase 10 | 14–17 Sep | Final documentation, demo and handover | Planned |
 
 ## 8. Testing Strategy
 
-- **Now:** automated end-to-end API suite (`bash test.sh`) — 65 assertions, passing on **both SQLite and PostgreSQL**, plus a load-test script (`bash loadtest.sh`). Covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, CMS editing, encryption-at-rest verification (asserts the raw database column is ciphertext) and the audit trail. Runs against a throwaway database.
+- **Now:** automated end-to-end API suite (`bash test.sh`) — 85 assertions, passing on **both SQLite and PostgreSQL**, plus a load-test script (`bash loadtest.sh`). Covering the full patient→pharmacy→doctor→admin workflow, OTP registration, RBAC denial cases, stock/oversell edge cases, Stripe payment verification (+ tamper rejection), the payment→notification event chain, teleconsultation chat access control, refill reminders, admin reporting aggregates, taxonomy management, CMS editing, encryption-at-rest verification (asserts the raw database column is ciphertext), the audit trail, GST invoice numbering and tax extraction, invoice immutability under a catalogue change, the dispatch-without-a-carrier block, and the stock ledger. Runs against a throwaway database.
 - **Later phases:** browser automation for critical UI flows; production smoke tests after deployment.
 
 ## 9. Risks & Mitigations

@@ -227,6 +227,64 @@ assert_eq "$PTAUD" "Not allowed for your role" "non-admin blocked from the audit
 
 # ============ Phase 7: consent, subject rights, retention, key rotation ============
 
+# --- Phase 8: GST invoice raised with the order ---
+INV=$(curl -s -H "Authorization: Bearer $PT" $B/orders/$OID/invoice)
+# the expected financial year, worked out independently of the code under test
+FY=$(python3 -c "
+from datetime import datetime, timezone
+d = datetime.now(timezone.utc); y = d.year if d.month >= 4 else d.year - 1
+print(f'{y}-{str(y + 1)[-2:]}')")
+assert_eq "$(echo "$INV" | jget '["invoice_no"]')" "INV/$FY/0001" "invoice numbered per pharmacy per financial year"
+# 2 x Paracetamol at MRP 30 = 60 inclusive of 5% GST -> taxable 57.14, tax 2.86, total unchanged
+assert_eq "$(echo "$INV" | jget '["taxable_total"]')" "57.14" "taxable value extracted from GST-inclusive MRP"
+assert_eq "$(echo "$INV" | jget '["tax_total"]')" "2.86" "GST amount extracted, not added on top"
+assert_eq "$(echo "$INV" | jget '["grand_total"]')" "60" "invoice total equals what the patient paid"
+assert_eq "$(echo "$INV" | jget '["tax_summary"][0]["cgst"]')" "1.43" "tax split half CGST half SGST"
+DENIED=$(curl -s -H "Authorization: Bearer $DR" $B/orders/$OID/invoice | jget '["error"]')
+assert_eq "$DENIED" "Order not found" "unrelated party cannot read an invoice"
+
+# An issued invoice is a historical document: moving the product to another GST slab must not
+# retrospectively change the tax already charged to the customer.
+curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":12}' $B/medicines/1 >/dev/null
+REPRICED=$(curl -s -H "Authorization: Bearer $PT" $B/orders/$OID/invoice | jget '["lines"][0]["gst_rate"]')
+assert_eq "$REPRICED" "5" "issued invoice keeps the rate charged, not the product's new rate"
+curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":5}' $B/medicines/1 >/dev/null
+
+# --- Phase 8: nothing ships without a carrier ---
+NOCARRIER=$(curl -s -X PATCH -H "Authorization: Bearer $PH" $B/orders/$OID | jget '["error"][:6]')
+assert_eq "$NOCARRIER" "Assign" "delivery order cannot be shipped unassigned"
+
+NOTRACK=$(curl -s -X POST $J -H "Authorization: Bearer $PH" \
+  -d '{"delivery_mode":"partner","courier_name":"Delhivery"}' $B/orders/$OID/delivery | jget '["error"][:8]')
+assert_eq "$NOTRACK" "Courier " "partner courier requires a tracking number"
+
+ASSIGN=$(curl -s -X POST $J -H "Authorization: Bearer $PH" \
+  -d '{"delivery_mode":"own","courier_name":"Suresh Kadam","rider_phone":"9876500030"}' $B/orders/$OID/delivery)
+assert_eq "$(echo "$ASSIGN" | jget '["delivery_mode"]')" "own" "order assigned to own rider"
+assert_eq "$(echo "$ASSIGN" | jget '["courier_name"]')" "Suresh Kadam" "rider recorded on the order"
+
+S=$(curl -s -X PATCH -H "Authorization: Bearer $PH" $B/orders/$OID | jget '["status"]')
+assert_eq "$S" "shipped" "assigned order ships"
+
+# --- Phase 8: stock ledger explains every movement ---
+LEDGER=$(curl -s -H "Authorization: Bearer $PH" $B/medicines/1/stock)
+assert_eq "$(echo "$LEDGER" | jget '[0]["reason"]')" "sale" "the order wrote a sale movement"
+assert_eq "$(echo "$LEDGER" | jget '[0]["delta"]')" "-2" "sale movement records the units sold"
+assert_eq "$(echo "$LEDGER" | jget '[0]["balance"]')" "198" "movement records the balance after it"
+assert_eq "$(echo "$LEDGER" | jget '[-1]["reason"]')" "opening" "opening stock is itself a movement"
+
+RESTOCK=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":50,"reason":"restock"}' $B/medicines/1/stock)
+assert_eq "$(echo "$RESTOCK" | jget '["stock"]')" "248" "restock raises the stock level"
+
+TOOMANY=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":-9999,"reason":"expiry"}' $B/medicines/1/stock | jget '["error"][:4]')
+assert_eq "$TOOMANY" "Only" "cannot write off more units than are on the shelf"
+
+BADREASON=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":5,"reason":"whatever"}' $B/medicines/1/stock | jget '["error"]')
+assert_eq "$BADREASON" "Unknown reason" "stock movements need a known reason"
+
+DENIED=$(curl -s -H "Authorization: Bearer $PT" $B/medicines/1/stock | jget '["error"]')
+assert_eq "$DENIED" "Not allowed for your role" "patients cannot read the stock ledger"
+
 # --- consent is mandatory and recorded ---
 NOCONSENT=$(curl -s $J -d '{"role":"patient","name":"NC","email":"nc@test.com","password":"secret1","otp":"1"}' $B/register | jget '["error"][:8]')
 assert_eq "$NOCONSENT" "You must" "registration without consent rejected"

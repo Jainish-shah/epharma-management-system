@@ -170,11 +170,31 @@ for the analysis document and development plan, and
 - **Encryption-key rotation** — `EPHARMA_ENC_KEY_OLD` lets a retired key still decrypt while the new
   key encrypts; `python manage.py rotate_encryption_key` re-encrypts existing rows.
 
+### Phase 8 additions (fulfilment & billing)
+
+- **GST tax invoices** — every paid order raises a tax invoice with a serial that is consecutive
+  per pharmacy and reset each financial year (`INV/2026-27/0007`), as CGST Rule 46(b) requires.
+  MRP is GST-inclusive, so the invoice *extracts* the tax rather than adding it: the patient pays
+  exactly the cart total, and the invoice shows the taxable value, CGST and SGST behind it.
+  `GET /api/orders/:id/invoice`; printable to PDF from the browser.
+- **Immutable line snapshots** — `order_items` now stores the GST rate alongside the price, so
+  re-slabbing a product never rewrites an invoice that has already been issued.
+- **Delivery assignment** — a pharmacy hands each delivery order to its own rider (name + contact)
+  or to a partner courier (company + tracking number) via `POST /api/orders/:id/delivery`. Nothing
+  can be marked *shipped* until it has a carrier, and the patient sees who is holding the order.
+- **Stock in/out ledger** — `stock_moves` records every movement with its reason (opening, sale,
+  restock, return, damage, expiry, adjustment), the resulting balance and who caused it.
+  `GET/POST /api/medicines/:id/stock`. Editing the stock field directly is still allowed but is
+  logged as an adjustment, so no change to a stock level goes unexplained.
+
 ## API overview
 
 | Area | Endpoints |
 |---|---|
 | Payments | `POST /api/payments/create` (patient — payment intent for the cart) |
+| Billing | `GET /api/orders/:id/invoice` (patient/pharmacy/admin — GST tax invoice) |
+| Fulfilment | `POST /api/orders/:id/delivery` (pharmacy — assign own rider or partner courier) |
+| Stock ledger | `GET/POST /api/medicines/:id/stock` (pharmacy — movement history, stock in/out) |
 | Consultation | `GET/POST /api/appointments/:id/messages`, `GET /api/appointments/:id/room` (patient/doctor party only) |
 | Refills | `GET /api/refills` (patient) |
 | Privacy (self-service) | `GET /api/me/data` (export), `DELETE /api/me/delete` (erasure) |
@@ -190,8 +210,8 @@ for the analysis document and development plan, and
 |---|---|
 | Auth | `POST /api/register/send-otp`, `POST /api/register`, `POST /api/login`, `POST /api/logout`, `GET/PATCH /api/me`, `POST /api/me/documents` |
 | Catalog (public) | `GET /api/medicines?search=`, `GET /api/doctors?search=` |
-| Inventory (pharmacy) | `GET /api/my-medicines`, `POST/PATCH/DELETE /api/medicines[/:id]` |
-| Orders | `POST /api/orders` (patient), `GET /api/orders` (role-scoped), `PATCH /api/orders/:id` (pharmacy advances status) |
+| Inventory (pharmacy) | `GET /api/my-medicines`, `POST/PATCH/DELETE /api/medicines[/:id]`, `GET/POST /api/medicines/:id/stock` |
+| Orders | `POST /api/orders` (patient), `GET /api/orders` (role-scoped), `PATCH /api/orders/:id` (pharmacy advances status), `POST /api/orders/:id/delivery` (assign carrier), `GET /api/orders/:id/invoice` |
 | Appointments | `POST /api/appointments` (patient), `GET /api/appointments`, `PATCH /api/appointments/:id` (doctor) |
 | Prescriptions | `POST /api/prescriptions` (doctor), `POST /api/prescriptions/upload` (patient), `GET /api/prescriptions` |
 | Notifications | `GET /api/notifications`, `POST /api/notifications/read` |
@@ -235,3 +255,8 @@ KAFKA_BROKERS=localhost:9092 npm start
 - **OTP** delivery is demo-mode (code returned/logged) until an SMS/email gateway is wired.
 - Prescription and document images stored as data URLs in SQLite — move to file/object storage if sizes grow.
 - Single-process SQLite — fine for demo/dev; migrate to Postgres/MySQL for production ERP scale (Phase 5).
+- **Invoices assume an intra-state supply** (CGST + SGST). An inter-state order would carry a single
+  IGST line instead, which needs a state code on both parties — the registration form does not collect
+  one yet. The split lives in one function (`api/billing.py`).
+- **Delivery tracking is a record, not a live feed** — the courier and tracking reference are stored and
+  shown, but the app does not call the courier's API for location updates.

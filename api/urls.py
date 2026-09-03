@@ -18,11 +18,14 @@ urlpatterns = [
     path("logout", views.logout),
     path("medicines", views.medicines),
     path("medicines/<int:id>", views.medicine_detail),
+    path("medicines/<int:id>/stock", views.medicine_stock),   # stock in/out ledger
     path("my-medicines", views.my_medicines),
     path("doctors", views.doctors),
     path("payments/create", views.payments_create),
     path("orders", views.orders),
     path("orders/<int:id>", views.order_detail),
+    path("orders/<int:id>/invoice", views.order_invoice),    # GST tax invoice
+    path("orders/<int:id>/delivery", views.order_delivery),  # assign rider / courier
     path("appointments", views.appointments),
     path("appointments/<int:id>", views.appointment_detail),
     path("appointments/<int:id>/messages", views.appointment_messages),

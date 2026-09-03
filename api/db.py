@@ -170,7 +170,11 @@ CREATE TABLE IF NOT EXISTS tokens (
 CREATE TABLE IF NOT EXISTS medicines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pharmacy_id INTEGER NOT NULL REFERENCES users(id),
-  name TEXT NOT NULL, category TEXT NOT NULL, price REAL NOT NULL, stock INTEGER NOT NULL DEFAULT 0
+  name TEXT NOT NULL, category TEXT NOT NULL, price REAL NOT NULL, stock INTEGER NOT NULL DEFAULT 0,
+  -- Phase 8 (billing): GST slab for this medicine (5% or 12% for most pharmaceuticals).
+  -- `price` is the MRP and is GST-INCLUSIVE, as Indian retail prices are; the invoice
+  -- back-computes the taxable value from it rather than adding tax on top.
+  gst_rate REAL NOT NULL DEFAULT 5
 );
 -- Tables are declared in dependency order (a table's REFERENCES targets must already exist —
 -- SQLite tolerates forward references, PostgreSQL does not).
@@ -199,13 +203,25 @@ CREATE TABLE IF NOT EXISTS orders (
   type TEXT NOT NULL DEFAULT 'delivery' CHECK (type IN ('delivery','pickup')),
   address TEXT, total REAL NOT NULL,
   prescription_id INTEGER REFERENCES prescriptions(id),
+  -- Phase 8 (billing): the GST invoice raised for this order. Issued once, at order time
+  -- (payment is already verified by then), and never rewritten — an invoice number that moves
+  -- is a tax problem, not a display bug.
+  invoice_no TEXT, invoice_at TEXT,
+  -- Phase 8 (fulfilment): who is carrying this order. 'own' = the pharmacy's own rider,
+  -- 'partner' = a third-party courier with a tracking reference.
+  delivery_mode TEXT CHECK (delivery_mode IN ('own','partner')),
+  courier_name TEXT, rider_phone TEXT, tracking_no TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id),
   medicine_id INTEGER NOT NULL REFERENCES medicines(id),
-  name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL
+  -- name, price and gst_rate are SNAPSHOTS taken at purchase. A tax invoice must say what was
+  -- charged on the day it was issued, so none of them may be re-read from `medicines` later:
+  -- editing a product must never rewrite an invoice that has already been given to a customer.
+  name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL,
+  gst_rate REAL NOT NULL DEFAULT 5
 );
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +266,27 @@ CREATE TABLE IF NOT EXISTS audit_log (
   user_id INTEGER, actor TEXT, action TEXT NOT NULL, detail TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Phase 8: every movement of stock, in or out, with the reason and who caused it. The medicines
+-- table holds the current level; this table explains how it got there.
+CREATE TABLE IF NOT EXISTS stock_moves (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  medicine_id INTEGER NOT NULL REFERENCES medicines(id),
+  pharmacy_id INTEGER NOT NULL REFERENCES users(id),
+  delta INTEGER NOT NULL,          -- negative = out (a sale), positive = in (a restock)
+  balance INTEGER NOT NULL,        -- level AFTER the move, so the ledger reads without replaying it
+  reason TEXT NOT NULL,            -- sale | restock | adjustment | damage | expiry | return
+  actor_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- Phase 8: GST invoice numbers must be consecutive per supplier and reset each financial year
+-- (CGST Rule 46(b)), so the series cannot be derived from the global order id. One counter row per
+-- pharmacy per FY; incrementing it takes a row lock, which is what serialises concurrent checkouts.
+CREATE TABLE IF NOT EXISTS invoice_seq (
+  pharmacy_id INTEGER NOT NULL REFERENCES users(id),
+  fy TEXT NOT NULL,
+  last_no INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (pharmacy_id, fy)
+);
 """
 
 
@@ -280,6 +317,14 @@ _ADDED_COLUMNS = [
     ("users", "consent_at", "TEXT"),
     ("users", "anonymised_at", "TEXT"),
     ("tokens", "created_at", "TEXT"),
+    ("medicines", "gst_rate", "REAL DEFAULT 5"),
+    ("order_items", "gst_rate", "REAL DEFAULT 5"),
+    ("orders", "invoice_no", "TEXT"),
+    ("orders", "invoice_at", "TEXT"),
+    ("orders", "delivery_mode", "TEXT"),
+    ("orders", "courier_name", "TEXT"),
+    ("orders", "rider_phone", "TEXT"),
+    ("orders", "tracking_no", "TEXT"),
 ]
 
 
@@ -287,6 +332,11 @@ def _migrate():
     for table, column, coltype in _ADDED_COLUMNS:
         if column not in _columns(table):
             run(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    # Created here rather than in SCHEMA because it covers a column that ALTER may have just added.
+    # Belt to the invoice counter's braces: if the serial were ever handed out twice, this turns a
+    # silent duplicate invoice number into a failed order. (NULLs are exempt on both backends, so
+    # pre-Phase-8 orders without an invoice are unaffected.)
+    run("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_invoice ON orders (pharmacy_id, invoice_no)")
 
 
 def init_and_seed():
@@ -359,22 +409,28 @@ def _seed_demo_data():
     add_user(role="patient", name="Priya Sharma", email="priya@gmail.com", password="patient123",
              phone="9876500020", address="12 Rose Villa, Baner, Pune")
 
+    # (name, category, MRP incl. GST, opening stock, GST slab %) — most medicines are 5%,
+    # supplements and nutraceuticals sit in the 12% slab.
     meds = [
-        ("Paracetamol 500mg (10 tabs)", "Pain Relief", 30, 200),
-        ("Ibuprofen 400mg (10 tabs)", "Pain Relief", 45, 150),
-        ("Amoxicillin 250mg (10 caps)", "Antibiotics", 80, 90),
-        ("Azithromycin 500mg (3 tabs)", "Antibiotics", 110, 70),
-        ("Cetirizine 10mg (10 tabs)", "Allergy", 25, 300),
-        ("Metformin 500mg (20 tabs)", "Diabetes", 60, 120),
-        ("Insulin Glargine 100IU", "Diabetes", 850, 40),
-        ("Amlodipine 5mg (15 tabs)", "Blood Pressure", 55, 100),
-        ("Omeprazole 20mg (15 caps)", "Digestive", 70, 110),
-        ("Cough Syrup 100ml", "Cold & Flu", 95, 80),
-        ("Vitamin D3 60K (4 caps)", "Supplements", 130, 140),
-        ("ORS Sachets (pack of 5)", "Hydration", 40, 250),
+        ("Paracetamol 500mg (10 tabs)", "Pain Relief", 30, 200, 5),
+        ("Ibuprofen 400mg (10 tabs)", "Pain Relief", 45, 150, 5),
+        ("Amoxicillin 250mg (10 caps)", "Antibiotics", 80, 90, 5),
+        ("Azithromycin 500mg (3 tabs)", "Antibiotics", 110, 70, 5),
+        ("Cetirizine 10mg (10 tabs)", "Allergy", 25, 300, 5),
+        ("Metformin 500mg (20 tabs)", "Diabetes", 60, 120, 5),
+        ("Insulin Glargine 100IU", "Diabetes", 850, 40, 5),
+        ("Amlodipine 5mg (15 tabs)", "Blood Pressure", 55, 100, 5),
+        ("Omeprazole 20mg (15 caps)", "Digestive", 70, 110, 5),
+        ("Cough Syrup 100ml", "Cold & Flu", 95, 80, 5),
+        ("Vitamin D3 60K (4 caps)", "Supplements", 130, 140, 12),
+        ("ORS Sachets (pack of 5)", "Hydration", 40, 250, 12),
     ]
-    for m in meds:
-        run("INSERT INTO medicines (pharmacy_id, name, category, price, stock) VALUES (?, ?, ?, ?, ?)", (medplus, *m))
+    for name, category, price, stock, gst in meds:
+        mid = run("INSERT INTO medicines (pharmacy_id, name, category, price, stock, gst_rate) "
+                  "VALUES (?, ?, ?, ?, ?, ?)", (medplus, name, category, price, stock, gst))
+        # The opening balance is itself a stock movement, so the ledger explains every unit on hand.
+        run("INSERT INTO stock_moves (medicine_id, pharmacy_id, delta, balance, reason, actor_id) "
+            "VALUES (?, ?, ?, ?, 'opening', ?)", (mid, medplus, stock, stock, medplus))
 
     # Pending doctor & pharmacy ship with demo verification documents so the admin approval flow is demoable.
     def placeholder_doc(text):

@@ -19,6 +19,11 @@ export function OrdersTab({ user }) {
     } catch (err) { toast(err.message, true); }
   };
 
+  const showInvoice = async (id) => {
+    try { openModal(<Invoice data={await api(`/api/orders/${id}/invoice`)} />); }
+    catch (err) { toast(err.message, true); }
+  };
+
   // The next step in the pipeline, branching on delivery vs pickup.
   const nextLabel = (o) => ({
     pending: 'Start preparing',
@@ -35,7 +40,7 @@ export function OrdersTab({ user }) {
         <thead>
           <tr>
             <th>#</th><th>{user.role === 'patient' ? 'Pharmacy' : 'Patient'}</th><th>Items</th>
-            <th>Type</th><th>Total</th><th>Status</th><th>Rx</th>
+            <th>Type</th><th>Total</th><th>Status</th><th>Rx</th><th>Invoice</th>
             {user.role === 'pharmacy' && <th>Action</th>}
           </tr>
         </thead>
@@ -45,19 +50,160 @@ export function OrdersTab({ user }) {
               <td>{o.id}<br /><span className="meta" style={{ fontSize: 11 }}>{o.created_at}</span></td>
               <td>{user.role === 'patient' ? o.store_name : o.patient_name}</td>
               <td>{o.items.map((i) => <div key={i.id}>{i.name} × {i.qty}</div>)}</td>
-              <td>{o.type}{o.type === 'delivery' && o.address && <><br /><span className="meta" style={{ fontSize: 11 }}>{o.address}</span></>}</td>
+              <td>
+                {o.type}
+                {o.type === 'delivery' && o.address && <><br /><span className="meta" style={{ fontSize: 11 }}>{o.address}</span></>}
+                {/* Once a carrier is assigned everyone on the order can see who is holding it. */}
+                {o.courier_name && (
+                  <><br /><span className="meta" style={{ fontSize: 11 }}>
+                    🚚 {o.courier_name}{o.rider_phone && ` · ${o.rider_phone}`}
+                    {o.tracking_no && ` · ${o.tracking_no}`}
+                  </span></>
+                )}
+              </td>
               <td>{money(o.total)}</td>
               <td><Pill status={o.status} /></td>
               <td>{o.prescription
                 ? <button className="btn secondary small" onClick={() => openModal(<RxViewer title={`Prescription — order #${o.id}`} content={o.prescription} />)}>View</button>
                 : '—'}</td>
+              <td>{o.invoice_no
+                ? <button className="btn secondary small" onClick={() => showInvoice(o.id)}>{o.invoice_no}</button>
+                : '—'}</td>
               {user.role === 'pharmacy' && (
-                <td>{nextLabel(o) ? <button className="btn small" onClick={() => advance(o.id)}>{nextLabel(o)}</button> : '✓'}</td>
+                <td>
+                  {nextLabel(o) ? <button className="btn small" onClick={() => advance(o.id)}>{nextLabel(o)}</button> : '✓'}
+                  {/* Assignment is offered until the order leaves the store; after that it is fixed. */}
+                  {o.type === 'delivery' && ['pending', 'preparing'].includes(o.status) && (
+                    <> <button className="btn secondary small"
+                               onClick={() => openModal(<AssignDelivery order={o} onDone={load} />)}>
+                      {o.delivery_mode ? 'Reassign' : 'Assign delivery'}
+                    </button></>
+                  )}
+                </td>
               )}
             </tr>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/* Assign an order to the pharmacy's own rider or to a partner courier. The two modes need
+ * different details, so the form swaps its second field rather than asking for both. */
+function AssignDelivery({ order, onDone }) {
+  const { closeModal, toast } = useUI();
+  const [f, setF] = useState({
+    delivery_mode: order.delivery_mode || 'own',
+    courier_name: order.courier_name || '',
+    rider_phone: order.rider_phone || '',
+    tracking_no: order.tracking_no || '',
+  });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const own = f.delivery_mode === 'own';
+
+  const save = async () => {
+    try {
+      await api(`/api/orders/${order.id}/delivery`, { method: 'POST', body: f });
+      closeModal();
+      toast('Delivery assigned — the patient has been notified');
+      onDone();
+    } catch (err) { toast(err.message, true); }
+  };
+
+  return (
+    <div>
+      <h2>Assign delivery</h2>
+      <div className="sub">Order #{order.id} · {order.address}</div>
+      <label htmlFor="delMode">Delivered by</label>
+      <select id="delMode" value={f.delivery_mode} onChange={set('delivery_mode')}>
+        <option value="own">Our own rider</option>
+        <option value="partner">Partner courier</option>
+      </select>
+      <label htmlFor="delName">{own ? 'Rider name' : 'Courier company'}</label>
+      <input id="delName" value={f.courier_name} onChange={set('courier_name')}
+             placeholder={own ? 'Suresh Kadam' : 'Delhivery'} />
+      {own ? (
+        <>
+          <label htmlFor="delPhone">Rider contact number</label>
+          <input id="delPhone" value={f.rider_phone} onChange={set('rider_phone')} placeholder="9876500030" />
+        </>
+      ) : (
+        <>
+          <label htmlFor="delTrack">Tracking number</label>
+          <input id="delTrack" value={f.tracking_no} onChange={set('tracking_no')} placeholder="DLV1234567890" />
+        </>
+      )}
+      <ModalActions>
+        <button className="btn secondary" onClick={closeModal}>Cancel</button>
+        <button className="btn" onClick={save}>Assign</button>
+      </ModalActions>
+    </div>
+  );
+}
+
+/* GST tax invoice. Printing is the browser's own print dialog against a print stylesheet, which
+ * gives a PDF on every platform without shipping a PDF library. */
+function Invoice({ data }) {
+  const { closeModal } = useUI();
+  return (
+    <div className="invoice-sheet">
+      <div className="inv-head">
+        <div>
+          <h2>Tax Invoice</h2>
+          <div className="meta">{data.invoice_no} · {data.invoice_at}</div>
+        </div>
+        <div className="meta" style={{ textAlign: 'right' }}>
+          Order #{data.order_id}<br />Place of supply: {data.place_of_supply}
+        </div>
+      </div>
+
+      <div className="inv-parties">
+        <div>
+          <b>Sold by</b><br />{data.seller.name}<br />
+          <span className="meta">{data.seller.address}</span><br />
+          <span className="meta">GSTIN {data.seller.gstin} · Drug licence {data.seller.license_no}</span>
+        </div>
+        <div>
+          <b>Billed to</b><br />{data.buyer.name}<br />
+          <span className="meta">{data.buyer.address}</span>
+          {data.buyer.phone && <><br /><span className="meta">{data.buyer.phone}</span></>}
+        </div>
+      </div>
+
+      <div className="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Description</th><th>Qty</th><th>Rate</th><th>Taxable</th><th>GST%</th><th>CGST</th><th>SGST</th><th>Amount</th></tr>
+        </thead>
+        <tbody>
+          {data.lines.map((l, i) => (
+            <tr key={i}>
+              <td>{l.name}</td><td>{l.qty}</td><td>{l.rate.toFixed(2)}</td><td>{l.taxable.toFixed(2)}</td>
+              <td>{l.gst_rate}%</td><td>{l.cgst.toFixed(2)}</td><td>{l.sgst.toFixed(2)}</td>
+              <td>{l.gross.toFixed(2)}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colSpan="3">Total</td><td>{data.taxable_total.toFixed(2)}</td><td />
+            <td>{data.cgst_total.toFixed(2)}</td><td>{data.sgst_total.toFixed(2)}</td>
+            <td>{money(data.grand_total)}</td>
+          </tr>
+        </tfoot>
+      </table>
+      </div>
+
+      <div className="inv-note">
+        Rate-wise tax: {data.tax_summary.map((t) => `${t.gst_rate}% on ₹${t.taxable.toFixed(2)} — CGST ₹${t.cgst.toFixed(2)} + SGST ₹${t.sgst.toFixed(2)}`).join(' · ')}<br />
+        Prices are inclusive of GST. This is a computer-generated invoice and needs no signature.
+      </div>
+
+      <ModalActions>
+        <button className="btn secondary no-print" onClick={closeModal}>Close</button>
+        <button className="btn no-print" onClick={() => window.print()}>🖨 Print / Save PDF</button>
+      </ModalActions>
     </div>
   );
 }
