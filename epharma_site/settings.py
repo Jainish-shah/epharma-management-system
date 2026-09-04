@@ -39,6 +39,9 @@ INSTALLED_APPS = ["api"]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # Rate limiting sits last so it runs closest to the view: a refused request still gets the
+    # security headers above it, and the counter is not spent on requests the layers above reject.
+    "api.ratelimit.RateLimitMiddleware",
 ]
 
 ROOT_URLCONF = "epharma_site.urls"

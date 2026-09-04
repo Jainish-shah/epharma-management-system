@@ -136,9 +136,11 @@ Three scripts, three different jobs.
 
 | Command | What it proves | When to run it |
 |---|---|---|
-| `bash test.sh` | 85 end-to-end assertions across all four roles | Before every commit |
+| `bash test.sh` | 91 end-to-end assertions across all four roles | Before every commit |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating, and sending security headers | After every release |
-| `bash loadtest.sh` | Throughput and latency under concurrency | Before a capacity decision |
+| `bash loadtest.sh` | Throughput and latency under concurrency (ApacheBench) | Before a capacity decision |
+| `bash loadtest-locust.sh` | Concurrent-user behaviour: realistic load, the throughput ceiling, and 429 shedding | Before a capacity or scaling decision |
+| `bash db-contention-test.sh` | How database concurrency scales with workers, and what happens when the database refuses a connection | When sizing workers, or after a connection incident |
 
 **`test.sh`** starts the application on a throwaway database and port, so it never touches your
 working data. It covers the money and security paths specifically: payment signature verification and
@@ -397,6 +399,72 @@ destroyed.
 
 ---
 
+### 8.7 Rate limiting and capacity
+
+Every `/api/` route is rate limited per client IP, in two tiers:
+
+| Tier | Covers | Default |
+|---|---|---|
+| `auth` | `/api/login`, `/api/register*`, `/api/me/delete` | 10 per minute (`RATE_LIMIT_AUTH`) |
+| `default` | every other `/api/` route | 120 per minute (`RATE_LIMIT`) |
+
+The window is `RATE_LIMIT_WINDOW` seconds (default 60), and `RATE_LIMIT_ENABLED=0` switches the
+whole thing off — do that when load testing, so you measure the service and not the limiter.
+
+`/api/health` is never limited — a throttled health check makes a load balancer pull a healthy
+instance out of rotation. Static assets are not limited either; one page load pulls several.
+
+A refused request returns **429** with a JSON body, `Retry-After`, and `RateLimit-Limit` /
+`-Remaining` / `-Reset` so a well-behaved client can back off before it is refused.
+
+> **`DJANGO_TRUST_PROXY` matters.** The client IP comes from `REMOTE_ADDR` unless this is set to `1`.
+> Behind a load balancer that means every request appears to come from the proxy and the whole
+> platform shares one bucket — set it to `1` **only** when a trusted proxy sets `X-Forwarded-For`.
+> Trusting that header without a proxy in front lets anyone forge a fresh identity per request and
+> bypass the limit entirely.
+
+**Counters are per worker process**, so the effective limit is `workers x limit`. This fails
+permissive rather than wrongly locking a user out. Move the counter to Redis when the limit has to
+be exact across workers or containers — only `_hit()` in `api/ratelimit.py` changes.
+
+**Measured capacity** (this developer machine, SQLite, gunicorn, 50 saturating clients):
+
+| Workers | Throughput | p95 | Failures |
+|---|---|---|---|
+| 1 | ~1,350 req/s | 48 ms | 0 |
+| 2 | ~2,140 req/s | 29 ms | 0 |
+| 4 | ~2,360 req/s | 25 ms | 0 |
+| 8 | ~2,410 req/s | 28 ms | 0 |
+
+Throughput scales sharply from 1 to 2 workers and then flattens — past that point the machine's
+cores, not the application, are the limit. Under realistic load (60 users with think time) the same
+setup served ~73 req/s at a 10 ms p95, so it is idling. Re-measure on your own hardware before
+sizing: `bash db-contention-test.sh`.
+
+### 8.8 Database connections — there is no pool
+
+`api/db.py` opens **one connection per worker process** and serialises access to it with a global
+lock. Two consequences:
+
+1. **Inside a worker, database concurrency is 1** — however many threads the server has. Scale with
+   worker processes, not threads.
+2. **Total connections held = workers x containers.** Size this against PostgreSQL's
+   `max_connections` (minus `superuser_reserved_connections`) before scaling out. Exceeding it does
+   not queue — see below.
+
+> **Known defect — workers cannot boot without the database.** The connection is opened at module
+> import, so a worker that cannot reach the database, or that PostgreSQL refuses because
+> `max_connections` is exhausted, **dies during start-up**. It never reaches the health endpoint
+> that exists to report exactly this condition, so `/api/health` does not answer at all rather than
+> returning 503, and gunicorn crash-loops the workers until it exhausts its retry budget.
+>
+> Reproduce it with `bash db-contention-test.sh` (section 2).
+>
+> The fix is to open the connection lazily on first use and reconnect on failure, so a worker starts,
+> serves 503 from `/api/health`, and recovers by itself when the database returns. Until then, treat
+> a connection-budget overrun as a full outage rather than a degradation, and keep
+> `workers x containers` comfortably under the PostgreSQL limit.
+
 ## 9. Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -415,6 +483,10 @@ destroyed.
 | Test suite fails on a second PostgreSQL run | The database still holds data from the previous run | Drop and recreate the test database between runs |
 | An admin asks to delete their own account | Admins cannot self-erase, by design | Delete the row directly after confirming another admin exists — see §5.11 |
 | Startup logs are empty in a custom deployment | Python is buffering stdout | Set `PYTHONUNBUFFERED=1`. The provided Dockerfile already does |
+| Clients get 429 during normal use | The window allowance is too low, or every request appears to come from the proxy | Raise `RATE_LIMIT`, or set `DJANGO_TRUST_PROXY=1` if a trusted proxy sets `X-Forwarded-For` (§8.7) |
+| A load test reports thousands of failures | The harness measured through worker start-up, or rate limiting was left on | Wait for every worker to serve before measuring; set `RATE_LIMIT_ENABLED=0` when measuring capacity |
+| Workers crash-loop and `/api/health` never answers | The database is unreachable or out of connection slots | See §8.8 — the connection is opened at import, so the worker dies before it can report. Free connections or restore the database, then restart |
+| Adding threads did not increase throughput | Database access is serialised per process | Add worker processes instead (§8.8) |
 
 ---
 

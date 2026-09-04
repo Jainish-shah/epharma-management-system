@@ -51,12 +51,12 @@ Run Django and `npm run dev` side by side while developing; run the build before
 bash test.sh
 ```
 
-End-to-end API suite (85 assertions): full patient → pharmacy → doctor → admin workflow,
+End-to-end API suite (91 assertions): full patient → pharmacy → doctor → admin workflow,
 OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
 payment signature verification, teleconsultation chat, refill reminders, admin reports,
 taxonomy management, CMS editing, consent enforcement, data export, erasure, retention,
 GST invoice numbering and tax extraction, invoice immutability, delivery assignment and the
-stock ledger. Passes on both SQLite and PostgreSQL. Uses a throwaway database — never touches demo data.
+stock ledger, and rate limiting (429, Retry-After, health exemption). Passes on both SQLite and PostgreSQL. Uses a throwaway database — never touches demo data.
 [docs/runbook.md](docs/runbook.md) is the end-to-end operations runbook — running, verifying,
 walking the full business flow, deploying, operating, troubleshooting and recovery.
 See also [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
@@ -237,6 +237,10 @@ All optional — the app runs with sensible defaults and no configuration.
 | `POLICY_VERSION` | `1.0` | privacy-policy version recorded against each consent |
 | `RETAIN_OTPS_DAYS` / `RETAIN_TOKENS_DAYS` / `RETAIN_NOTIFICATIONS_DAYS` / `RETAIN_AUDIT_DAYS` | `1` / `30` / `180` / `365` | data-retention windows |
 | `REFILL_DAYS` | `30` | days after an order before a refill reminder is due |
+| `RATE_LIMIT_ENABLED` | `1` | set `0` to switch rate limiting off (load testing) |
+| `RATE_LIMIT` / `RATE_LIMIT_AUTH` | `120` / `10` | requests per window per client — general tier / auth tier |
+| `RATE_LIMIT_WINDOW` | `60` | rate-limit window in seconds |
+| `DJANGO_TRUST_PROXY` | `0` | trust `X-Forwarded-For` for the client IP — only behind a trusted proxy |
 | `DATABASE_URL` | _(unset)_ | `postgres://user:pass@host/db` — run on PostgreSQL instead of SQLite |
 | `EPHARMA_ENC_KEY` | demo key | secret used to encrypt medical records at rest — **set this in production** |
 
@@ -251,6 +255,25 @@ KAFKA_BROKERS=localhost:9092 .venv/bin/python manage.py runserver 127.0.0.1:3000
 `GET /api/health` reports `"events":"kafka"` once the broker is connected. If the client is missing
 or the broker is unreachable the app logs the reason and falls back to the in-process bus rather than
 failing to start.
+
+## Load testing
+
+Locust is a test tool, not a runtime dependency, so install it separately:
+
+```bash
+.venv/bin/pip install locust
+```
+
+```bash
+bash loadtest-locust.sh                 # 100 users, 60s, 4 workers
+bash loadtest-locust.sh 200 90s 8       # users, duration, workers
+bash db-contention-test.sh              # database concurrency and connection-refusal behaviour
+```
+
+`loadtest-locust.sh` runs three scenarios against a throwaway gunicorn instance: realistic traffic
+with think time, saturation to find the throughput ceiling, and an abusive client to show excess
+load being shed as 429. Scenarios live in [locustfile.py](locustfile.py) and can also be driven
+interactively (`locust -f locustfile.py --host ...` for the web UI on :8089).
 
 ## Deliberate simplifications (current scope)
 
@@ -268,3 +291,9 @@ failing to start.
   one yet. The split lives in one function (`api/billing.py`).
 - **Delivery tracking is a record, not a live feed** — the courier and tracking reference are stored and
   shown, but the app does not call the courier's API for location updates.
+- **Rate-limit counters live in process memory**, so with N gunicorn workers the effective limit is
+  N x the configured number. It fails permissive rather than wrongly locking a user out. Move the
+  counter to Redis when the limit must be exact across workers or containers — only `_hit()` changes.
+- **There is no database connection pool.** `api/db.py` opens one connection per worker process and
+  serialises access with a lock, so the unit of database concurrency is the worker process. See the
+  runbook for what this means operationally.

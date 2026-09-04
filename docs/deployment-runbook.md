@@ -60,6 +60,10 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # EPHARMA_ENC_KEY
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | no | Live Razorpay keys |
 | `KAFKA_BROKERS` | no | e.g. `broker:9092`. Unset uses the in-process event bus — see §7 |
 | `NOTIFY_CHANNELS` | no | `log`, `email`, `sms` (comma-separated) |
+| `RATE_LIMIT` / `RATE_LIMIT_AUTH` | no | Requests per window per client: general tier / auth tier. Defaults `120` / `10` |
+| `RATE_LIMIT_WINDOW` | no | Window in seconds (default `60`) |
+| `RATE_LIMIT_ENABLED` | no | `0` disables rate limiting — for load testing, not production |
+| `DJANGO_TRUST_PROXY` | no | `1` to take the client IP from `X-Forwarded-For`. **Set this behind a load balancer**, or every request shares one bucket. Never set it without a trusted proxy in front |
 
 > **Empty is not unset.** An empty value (`STRIPE_SECRET_KEY=`) is treated as unset and falls back to
 > the default. This matters because Compose passes unset variables through as empty strings.

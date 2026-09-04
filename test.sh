@@ -7,6 +7,11 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export EPHARMA_DB=$(mktemp -d)/test.db
 export PORT=3999
 export REFILL_DAYS=0   # refills immediately due, so the materialisation path is testable in one run
+# The whole suite runs from one IP and logs in 15 times, which would trip the auth tier. Rate
+# limiting stays ENABLED (so the middleware is still in the request path for every assertion below)
+# but with headroom; the limits themselves are asserted against a dedicated server at the end.
+export RATE_LIMIT=100000
+export RATE_LIMIT_AUTH=100000
 B="http://localhost:$PORT/api"
 J='-H Content-Type:application/json'
 
@@ -309,6 +314,33 @@ PURGE=$(curl -s -X POST $J -H "Authorization: Bearer $AD" $B/admin/retention/pur
 assert_eq "$(echo "$PURGE" | python3 -c 'import sys,json;print("otps" in json.load(sys.stdin)["removed"])')" "True" "retention purge reports what it removed"
 PURGEDENY=$(curl -s -X POST $J -H "Authorization: Bearer $PT" $B/admin/retention/purge | jget '["error"]')
 assert_eq "$PURGEDENY" "Not allowed for your role" "non-admin blocked from retention purge"
+
+# --- rate limiting: excess load is shed with 429 (own server, tight limits) ---
+RL_PORT=3997
+RATE_LIMIT=1000 RATE_LIMIT_AUTH=3 EPHARMA_DB=$(mktemp -d)/rl.db PORT=$RL_PORT \
+  "$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$RL_PORT --noreload >/dev/null 2>&1 &
+RL_PID=$!
+RB="http://localhost:$RL_PORT/api"
+for i in $(seq 1 40); do curl -s "$RB/health" >/dev/null && break; sleep 0.25; done
+
+# the auth tier allows 3 per window; the 4th must be refused
+for i in 1 2 3; do curl -s -o /dev/null $J -d '{"email":"priya@gmail.com","password":"patient123"}' $RB/login; done
+RL_CODE=$(curl -s -o /dev/null -w "%{http_code}" $J -d '{"email":"priya@gmail.com","password":"patient123"}' $RB/login)
+assert_eq "$RL_CODE" "429" "excess auth requests are refused with 429"
+
+RL_HEAD=$(curl -si $J -d '{"email":"priya@gmail.com","password":"patient123"}' $RB/login)
+assert_eq "$(echo "$RL_HEAD" | grep -ci '^Retry-After:')" "1" "429 carries a Retry-After header"
+assert_eq "$(echo "$RL_HEAD" | grep -ci '^RateLimit-Limit:')" "1" "rate-limit headers are advertised"
+assert_eq "$(echo "$RL_HEAD" | tail -1 | jget '["error"][:8]')" "Too many" "429 body is JSON, not an HTML error page"
+
+# a throttled health check would make a load balancer drop a healthy instance
+for i in $(seq 1 12); do curl -s -o /dev/null "$RB/health"; done
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "$RB/health")" "200" "health checks are never rate limited"
+
+# the default tier is separate: exhausting auth must not lock everyone out of the catalog
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "$RB/medicines")" "200" "auth throttling does not block the public catalog"
+
+kill $RL_PID 2>/dev/null
 
 # --- right to erasure (run last: it destroys this patient's identity) ---
 NOPW=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"password":"wrong"}' $B/me/delete | jget '["error"][:8]')

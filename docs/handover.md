@@ -47,6 +47,7 @@ administrative reporting, catalog and content suite.
 | `api/views.py` | Every REST endpoint (documented per endpoint) |
 | `api/db.py` | Schema, demo seed, and the query/get/run/transaction helpers |
 | `api/billing.py` | GST invoice numbering and tax calculation |
+| `api/ratelimit.py` | Per-client request rate limiting (429) |
 | `api/compliance.py` | Consent, data export, erasure and retention |
 | `api/crypto.py` | Encryption at rest for medical records |
 | `api/payments.py` | Stripe/Razorpay façade with signature verification |
@@ -54,9 +55,9 @@ administrative reporting, catalog and content suite.
 | `epharma_site/` | Django project: settings (incl. production security), URLs, WSGI |
 | `frontend/src/` | React source — see the README for the file-by-file breakdown |
 | `public/` | **Generated** React build, committed so the app runs with Python alone |
-| `test.sh` | 85-assertion end-to-end API suite |
+| `test.sh` | 91-assertion end-to-end API suite |
 | `smoketest.sh` | Read-only post-deployment verification |
-| `loadtest.sh` | Throughput/latency benchmark |
+| `loadtest.sh`, `loadtest-locust.sh`, `db-contention-test.sh` | Throughput/latency, concurrent-user load, database concurrency |
 | `Dockerfile`, `docker-compose.prod.yml`, `.env.example` | Deployment |
 | `docs/` | [Operations runbook](runbook.md), analysis & development plan, coding standards, deployment and demo runbooks, status reports |
 
@@ -89,7 +90,7 @@ npm run build --prefix frontend    # rebuild public/ — commit the result
 
 | Command | What it proves |
 |---|---|
-| `bash test.sh` | 85 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
+| `bash test.sh` | 91 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating and sending security headers |
 | `bash loadtest.sh` | Throughput and latency (measured locally: ~2.1–2.9k req/s, p95 ≤ 19 ms) |
 
