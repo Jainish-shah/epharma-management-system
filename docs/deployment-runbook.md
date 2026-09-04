@@ -152,5 +152,8 @@ PostgreSQL, and a write-locked transaction on SQLite.
 - [ ] `DATABASE_URL` points at PostgreSQL, and the database is not publicly reachable
 - [ ] Demo accounts removed (§6)
 - [ ] Database backups scheduled and a restore has been tested
-- [ ] Outstanding for full HIPAA/GDPR alignment: data-retention policy, consent capture at
-      registration, and encryption-key rotation
+- [ ] Retention purge scheduled as a nightly job (`POST /api/admin/retention/purge`)
+- [ ] `EPHARMA_ENC_KEY_OLD` is **not** set once a key rotation has finished
+
+For the full lifecycle — running, verifying, the business flow, operating, troubleshooting and
+recovery — see the [operations runbook](runbook.md).

@@ -14,8 +14,6 @@ prescription-based medicine ordering with real payment verification, teleconsult
 video), inventory and stock management, medical-record handling with encryption at rest, and a full
 administrative reporting, catalog and content suite.
 
-All six planned phases are complete.
-
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Project understanding & system analysis | ✅ |
@@ -23,7 +21,9 @@ All six planned phases are complete.
 | 3 | Commerce & consultation (payments, Kafka events, chat/video, refills) | ✅ |
 | 4 | Admin ERP & reporting (reports, SMS/email gateway, catalog, CMS) | ✅ |
 | 5 | Performance & security (PostgreSQL, encryption, audit log, load test, accessibility) | ✅ |
-| 6 | Deployment & handover | ✅ |
+| 6 | Deployment (Docker, gunicorn, smoke tests) and the React rewrite | ✅ |
+| 7 | Compliance & data governance (consent, access, erasure, retention, key rotation) | ✅ |
+| 8 | Fulfilment & billing (GST invoices, delivery assignment, stock ledger) | ✅ |
 
 ---
 
@@ -46,17 +46,19 @@ All six planned phases are complete.
 |---|---|
 | `api/views.py` | Every REST endpoint (documented per endpoint) |
 | `api/db.py` | Schema, demo seed, and the query/get/run/transaction helpers |
+| `api/billing.py` | GST invoice numbering and tax calculation |
+| `api/compliance.py` | Consent, data export, erasure and retention |
 | `api/crypto.py` | Encryption at rest for medical records |
 | `api/payments.py` | Stripe/Razorpay façade with signature verification |
 | `api/events.py` | Event bus (in-process / Kafka) |
 | `epharma_site/` | Django project: settings (incl. production security), URLs, WSGI |
 | `frontend/src/` | React source — see the README for the file-by-file breakdown |
 | `public/` | **Generated** React build, committed so the app runs with Python alone |
-| `test.sh` | 49-assertion end-to-end API suite |
+| `test.sh` | 85-assertion end-to-end API suite |
 | `smoketest.sh` | Read-only post-deployment verification |
 | `loadtest.sh` | Throughput/latency benchmark |
 | `Dockerfile`, `docker-compose.prod.yml`, `.env.example` | Deployment |
-| `docs/` | Analysis & development plan, coding standards, runbook, status reports |
+| `docs/` | [Operations runbook](runbook.md), analysis & development plan, coding standards, deployment and demo runbooks, status reports |
 
 ---
 
@@ -70,7 +72,8 @@ python3 -m venv .venv
 .venv/bin/python manage.py runserver 127.0.0.1:3000 --noreload
 ```
 
-**Production:** see [deployment-runbook.md](deployment-runbook.md).
+**Production:** see [runbook.md](runbook.md) for the end-to-end path and
+[deployment-runbook.md](deployment-runbook.md) for the full configuration reference.
 
 **Changing the UI** requires Node:
 
@@ -86,7 +89,7 @@ npm run build --prefix frontend    # rebuild public/ — commit the result
 
 | Command | What it proves |
 |---|---|
-| `bash test.sh` | 49 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
+| `bash test.sh` | 85 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating and sending security headers |
 | `bash loadtest.sh` | Throughput and latency (measured locally: ~2.1–2.9k req/s, p95 ≤ 19 ms) |
 
@@ -127,9 +130,10 @@ mocks, so each is a configuration change rather than development work.
 
 ## 8. Recommended next work
 
-1. **Compliance:** data-retention policy, consent capture at registration, and encryption-key
-   rotation — the remaining items for full HIPAA/GDPR alignment.
-2. **Scheduled jobs:** move refill-reminder evaluation out of the request path into a cron/worker.
+1. **Scheduled jobs:** move refill-reminder evaluation out of the request path into a cron/worker,
+   and run the retention purge nightly rather than on request.
+2. **Remaining workflow items:** admin role and permission management, consent-gated access for
+   doctors to a patient's history, and pharmacy selection by location or price.
 3. **Real-time consultation:** replace chat polling with Server-Sent Events or WebSockets.
 4. **Frontend tests:** the API is covered end to end; component-level tests for the React app would
    close the remaining gap.

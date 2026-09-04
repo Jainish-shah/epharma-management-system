@@ -51,11 +51,15 @@ Run Django and `npm run dev` side by side while developing; run the build before
 bash test.sh
 ```
 
-End-to-end API suite (65 assertions): full patient → pharmacy → doctor → admin workflow,
+End-to-end API suite (85 assertions): full patient → pharmacy → doctor → admin workflow,
 OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
 payment signature verification, teleconsultation chat, refill reminders, admin reports,
-taxonomy management, CMS editing, consent enforcement, data export, erasure and retention. Uses a throwaway database — never touches demo data.
-See [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
+taxonomy management, CMS editing, consent enforcement, data export, erasure, retention,
+GST invoice numbering and tax extraction, invoice immutability, delivery assignment and the
+stock ledger. Passes on both SQLite and PostgreSQL. Uses a throwaway database — never touches demo data.
+[docs/runbook.md](docs/runbook.md) is the end-to-end operations runbook — running, verifying,
+walking the full business flow, deploying, operating, troubleshooting and recovery.
+See also [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)
 for the analysis document and development plan, and
 [docs/coding-standards.md](docs/coding-standards.md) for the project coding standards.
 
@@ -239,10 +243,14 @@ All optional — the app runs with sensible defaults and no configuration.
 **Run with real Kafka:**
 
 ```bash
-docker compose up -d          # local single-node Kafka broker
-npm i kafkajs                 # optional dependency, loaded only when KAFKA_BROKERS is set
-KAFKA_BROKERS=localhost:9092 npm start
+docker compose up -d                          # local single-node Kafka broker
+.venv/bin/pip install kafka-python            # optional; imported only when KAFKA_BROKERS is set
+KAFKA_BROKERS=localhost:9092 .venv/bin/python manage.py runserver 127.0.0.1:3000 --noreload
 ```
+
+`GET /api/health` reports `"events":"kafka"` once the broker is connected. If the client is missing
+or the broker is unreachable the app logs the reason and falls back to the in-process bus rather than
+failing to start.
 
 ## Deliberate simplifications (current scope)
 
