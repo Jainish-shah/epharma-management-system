@@ -136,14 +136,16 @@ Three scripts, three different jobs.
 
 | Command | What it proves | When to run it |
 |---|---|---|
-| `bash test.sh` | 91 end-to-end assertions across all four roles | Before every commit |
+| `bash test.sh` | 106 end-to-end assertions across all four roles | Before every commit |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating, and sending security headers | After every release |
 | `bash loadtest.sh` | Throughput and latency under concurrency (ApacheBench) | Before a capacity decision |
 | `bash loadtest-locust.sh` | Concurrent-user behaviour: realistic load, the throughput ceiling, and 429 shedding | Before a capacity or scaling decision |
 | `bash db-contention-test.sh` | How database concurrency scales with workers, and what happens when the database refuses a connection | When sizing workers, or after a connection incident |
 
 **`test.sh`** starts the application on a throwaway database and port, so it never touches your
-working data. It covers the money and security paths specifically: payment signature verification and
+working data. Every assertion runs even after one fails, and the failures are listed together at the
+end — fixing them one per run is far slower than seeing them all at once. The script exits non-zero
+if any failed. It covers the money and security paths specifically: payment signature verification and
 tamper rejection, stock and oversell handling, role-based access denials, OTP enforcement, GST
 invoice numbering, invoice immutability, dispatch controls, the stock ledger, consent, data export
 and erasure — and it reads a raw database column to prove stored prescriptions are ciphertext.
@@ -154,9 +156,9 @@ It passes on **both** SQLite and PostgreSQL. To run it against PostgreSQL:
 DATABASE_URL="postgresql://user:pass@127.0.0.1:5432/epharma_test" bash test.sh
 ```
 
-> The PostgreSQL database must be **empty** at the start of each run — the suite seeds and then
-> erases a demo account, so a second run against the same database will fail. Drop and recreate it
-> between runs.
+The suite drops and recreates the `public` schema before it starts, so a PostgreSQL database can be
+reused run after run. (It seeds demo data and then erases one of the accounts, so without that reset
+a second run would fail.) **Point it only at a throwaway database** — the reset is destructive.
 
 **`smoketest.sh`** is read-only and safe against production. A non-zero exit means roll back.
 

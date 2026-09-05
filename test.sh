@@ -1,6 +1,11 @@
 #!/bin/bash
 # End-to-end API test: fresh throwaway DB, full workflow across all four roles.
-# Usage: npm test  (exits non-zero on first failure)
+#
+#   bash test.sh                                        # SQLite (throwaway file)
+#   DATABASE_URL=postgresql://user@host/db bash test.sh  # PostgreSQL (the DB is reset first)
+#
+# Every assertion runs even after one fails, and the failures are listed together at the end —
+# fixing them one per run is far slower than seeing them all at once. Exits non-zero if any failed.
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,13 +20,39 @@ export RATE_LIMIT_AUTH=100000
 B="http://localhost:$PORT/api"
 J='-H Content-Type:application/json'
 
+# The suite seeds demo data and then erases one of the accounts, so a second run against a database
+# that still holds the first run's data fails. SQLite gets a fresh file above; PostgreSQL is a
+# long-lived server, so drop its schema here and let the app recreate it on boot.
+if [ -n "$DATABASE_URL" ]; then
+  "$DIR/.venv/bin/python" - <<'RESET'
+import os, psycopg
+with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as c:
+    c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+print("PostgreSQL schema reset")
+RESET
+fi
+
 "$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$PORT --noreload >/dev/null 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$(dirname "$EPHARMA_DB")"' EXIT
+# `wait` inside the redirect suppresses the shell's "Terminated" job notice, which otherwise
+# prints after the summary and reads like a failure.
+trap '{ kill $SERVER_PID; wait $SERVER_PID; } 2>/dev/null || true; rm -rf "$(dirname "$EPHARMA_DB")"' EXIT
 for i in $(seq 1 40); do curl -s "$B/medicines" >/dev/null && break; sleep 0.25; done
 
 jget() { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
-assert_eq() { [ "$1" = "$2" ] || { echo "FAIL: $3 (expected '$2', got '$1')"; exit 1; }; echo "ok: $3"; }
+
+PASSED=0
+FAILURES=()
+# Records the outcome and ALWAYS returns 0, so `set -e` does not abort the run on a failed
+# assertion. The whole list is printed at the end and the script exits non-zero if any failed.
+assert_eq() {
+  if [ "$1" = "$2" ]; then
+    PASSED=$((PASSED + 1)); echo "ok: $3"
+  else
+    FAILURES+=("$3 — expected '$2', got '$1'"); echo "FAIL: $3 (expected '$2', got '$1')"
+  fi
+  return 0
+}
 
 # Phase 3: create a payment intent for the given items, then place the paid order. Echoes order JSON.
 # Provider-neutral: passes the opaque demoCheckout object straight back as `payment`.
@@ -36,6 +67,10 @@ print(json.dumps({**extra, 'items': items, 'payment': pay['demoCheckout']}))" "$
   curl -s $J -H "Authorization: Bearer $tok" -d "$body" $B/orders
 }
 
+# Resolve the medicine the suite works with by NAME. Using the literal id 1 meant a change to seed
+# order would quietly move these assertions onto a different product — and they would still pass.
+MED=$(curl -s "$B/medicines?search=Paracetamol" | jget '[0]["id"]')
+
 # --- patient: login, order, book appointment ---
 PT=$(curl -s $J -d '{"email":"priya@gmail.com","password":"patient123"}' $B/login | jget '["token"]')
 assert_eq "${#PT}" "48" "patient login returns token"
@@ -44,10 +79,10 @@ BAD=$(curl -s $J -d '{"email":"priya@gmail.com","password":"wrong"}' $B/login | 
 assert_eq "$BAD" "Invalid email or password" "wrong password rejected"
 
 NOPAY=$(curl -s $J -H "Authorization: Bearer $PT" \
-  -d '{"items":[{"medicine_id":1,"qty":1}],"type":"pickup"}' $B/orders | jget '["error"]')
+  -d "{\"items\":[{\"medicine_id\":$MED,\"qty\":1}],\"type\":\"pickup\"}" $B/orders | jget '["error"]')
 assert_eq "$NOPAY" "Payment required" "order without payment rejected"
 
-ORDER=$(pay_and_order "$PT" '[{"medicine_id":1,"qty":2}]' '{"type":"delivery","address":"Test Lane"}')
+ORDER=$(pay_and_order "$PT" "[{\"medicine_id\":$MED,\"qty\":2}]" '{"type":"delivery","address":"Test Lane"}')
 assert_eq "$(echo "$ORDER" | jget '["status"]')" "pending" "order placed after payment verified"
 OID=$(echo "$ORDER" | jget '["id"]')
 
@@ -55,7 +90,7 @@ STOCK=$(curl -s "$B/medicines?search=Paracetamol" | jget '[0]["stock"]')
 assert_eq "$STOCK" "198" "stock decremented after order"
 
 OVERSELL=$(curl -s $J -H "Authorization: Bearer $PT" \
-  -d '{"items":[{"medicine_id":1,"qty":9999}]}' $B/payments/create | jget '["error"][:4]')
+  -d "{\"items\":[{\"medicine_id\":$MED,\"qty\":9999}]}" $B/payments/create | jget '["error"][:4]')
 assert_eq "$OVERSELL" "Only" "overselling blocked at payment"
 
 APPT=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"doctor_id":2,"slot":"2026-07-15 · Mon 10:00"}' $B/appointments)
@@ -88,7 +123,11 @@ assert_eq "$DENIED" "Please log in" "anonymous blocked"
 
 # --- admin: approve pending doctor ---
 AD=$(curl -s $J -d '{"email":"admin@epharma.com","password":"admin123"}' $B/login | jget '["token"]')
-S=$(curl -s -X PATCH $J -H "Authorization: Bearer $AD" -d '{"status":"approved"}' $B/admin/users/4 | jget '["status"]')
+# Look the pending doctor up rather than assuming a seed id — a change to seed order would
+# otherwise point this assertion at a different account and still pass.
+PENDING_DR=$(curl -s -H "Authorization: Bearer $AD" $B/admin/users \
+  | python3 -c "import sys,json;print(next(u['id'] for u in json.load(sys.stdin) if u['role']=='doctor' and u['status']=='pending'))")
+S=$(curl -s -X PATCH $J -H "Authorization: Bearer $AD" -d '{"status":"approved"}' $B/admin/users/$PENDING_DR | jget '["status"]')
 assert_eq "$S" "approved" "admin approved pending doctor"
 REV=$(curl -s -H "Authorization: Bearer $AD" $B/admin/stats | jget '["revenue"]')
 assert_eq "$REV" "60" "admin stats revenue correct"
@@ -250,10 +289,10 @@ assert_eq "$DENIED" "Order not found" "unrelated party cannot read an invoice"
 
 # An issued invoice is a historical document: moving the product to another GST slab must not
 # retrospectively change the tax already charged to the customer.
-curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":12}' $B/medicines/1 >/dev/null
+curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":12}' $B/medicines/$MED >/dev/null
 REPRICED=$(curl -s -H "Authorization: Bearer $PT" $B/orders/$OID/invoice | jget '["lines"][0]["gst_rate"]')
 assert_eq "$REPRICED" "5" "issued invoice keeps the rate charged, not the product's new rate"
-curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":5}' $B/medicines/1 >/dev/null
+curl -s -X PATCH $J -H "Authorization: Bearer $PH" -d '{"gst_rate":5}' $B/medicines/$MED >/dev/null
 
 # --- Phase 8: nothing ships without a carrier ---
 NOCARRIER=$(curl -s -X PATCH -H "Authorization: Bearer $PH" $B/orders/$OID | jget '["error"][:6]')
@@ -272,22 +311,22 @@ S=$(curl -s -X PATCH -H "Authorization: Bearer $PH" $B/orders/$OID | jget '["sta
 assert_eq "$S" "shipped" "assigned order ships"
 
 # --- Phase 8: stock ledger explains every movement ---
-LEDGER=$(curl -s -H "Authorization: Bearer $PH" $B/medicines/1/stock)
+LEDGER=$(curl -s -H "Authorization: Bearer $PH" $B/medicines/$MED/stock)
 assert_eq "$(echo "$LEDGER" | jget '[0]["reason"]')" "sale" "the order wrote a sale movement"
 assert_eq "$(echo "$LEDGER" | jget '[0]["delta"]')" "-2" "sale movement records the units sold"
 assert_eq "$(echo "$LEDGER" | jget '[0]["balance"]')" "198" "movement records the balance after it"
 assert_eq "$(echo "$LEDGER" | jget '[-1]["reason"]')" "opening" "opening stock is itself a movement"
 
-RESTOCK=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":50,"reason":"restock"}' $B/medicines/1/stock)
+RESTOCK=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":50,"reason":"restock"}' $B/medicines/$MED/stock)
 assert_eq "$(echo "$RESTOCK" | jget '["stock"]')" "248" "restock raises the stock level"
 
-TOOMANY=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":-9999,"reason":"expiry"}' $B/medicines/1/stock | jget '["error"][:4]')
+TOOMANY=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":-9999,"reason":"expiry"}' $B/medicines/$MED/stock | jget '["error"][:4]')
 assert_eq "$TOOMANY" "Only" "cannot write off more units than are on the shelf"
 
-BADREASON=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":5,"reason":"whatever"}' $B/medicines/1/stock | jget '["error"]')
+BADREASON=$(curl -s -X POST $J -H "Authorization: Bearer $PH" -d '{"delta":5,"reason":"whatever"}' $B/medicines/$MED/stock | jget '["error"]')
 assert_eq "$BADREASON" "Unknown reason" "stock movements need a known reason"
 
-DENIED=$(curl -s -H "Authorization: Bearer $PT" $B/medicines/1/stock | jget '["error"]')
+DENIED=$(curl -s -H "Authorization: Bearer $PT" $B/medicines/$MED/stock | jget '["error"]')
 assert_eq "$DENIED" "Not allowed for your role" "patients cannot read the stock ledger"
 
 # --- consent is mandatory and recorded ---
@@ -315,6 +354,81 @@ assert_eq "$(echo "$PURGE" | python3 -c 'import sys,json;print("otps" in json.lo
 PURGEDENY=$(curl -s -X POST $J -H "Authorization: Bearer $PT" $B/admin/retention/purge | jget '["error"]')
 assert_eq "$PURGEDENY" "Not allowed for your role" "non-admin blocked from retention purge"
 
+# --- endpoints that had no coverage at all ---
+# /logout is the important one: a session that outlives its logout is a security defect, and
+# nothing was asserting that it does not.
+LOGOUT_TOK=$(curl -s $J -d '{"email":"store@medplus.com","password":"pharma123"}' $B/login | jget '["token"]')
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $LOGOUT_TOK" $B/my-medicines)" "200" "fresh token works before logout"
+curl -s -X POST -H "Authorization: Bearer $LOGOUT_TOK" $B/logout >/dev/null
+assert_eq "$(curl -s -H "Authorization: Bearer $LOGOUT_TOK" $B/my-medicines | jget '["error"]')" "Please log in" "logout revokes the token immediately"
+assert_eq "$(curl -s -H "Authorization: Bearer $PH" $B/my-medicines | python3 -c "import sys,json;print(len(json.load(sys.stdin))>0)")" "True" "logging one session out does not affect another"
+
+# /my-medicines — a pharmacy sees only its own stock, never a competitor's
+MINE=$(curl -s -H "Authorization: Bearer $PH" $B/my-medicines)
+assert_eq "$(echo "$MINE" | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")" "12" "pharmacy sees its own inventory"
+assert_eq "$(curl -s -H "Authorization: Bearer $PT" $B/my-medicines | jget '["error"]')" "Not allowed for your role" "patients cannot read pharmacy inventory"
+
+# /doctors — public listing must expose approved doctors only, and never a password hash
+DOCS=$(curl -s $B/doctors)
+assert_eq "$(echo "$DOCS" | python3 -c "import sys,json;print(all('password_hash' not in d for d in json.load(sys.stdin)))")" "True" "public doctor listing leaks no password hash"
+assert_eq "$(curl -s "$B/doctors?search=Cardio" | jget '[0]["specialization"]')" "Cardiology" "doctors are searchable by specialty"
+
+# /prescriptions/upload — the patient's own upload path (distinct from a doctor's e-prescription)
+UP=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"content":"data:image/png;base64,iVBORw0KGgo="}' $B/prescriptions/upload)
+assert_eq "$(echo "$UP" | jget '["kind"]')" "uploaded" "patient can upload a prescription"
+assert_eq "$(curl -s $J -H "Authorization: Bearer $PT" -d '{"content":""}' $B/prescriptions/upload | jget '["error"]')" "No file received" "an empty prescription upload is rejected"
+
+# /notifications/read — the unread badge must actually clear
+curl -s -X POST -H "Authorization: Bearer $PT" $B/notifications/read >/dev/null
+assert_eq "$(curl -s -H "Authorization: Bearer $PT" $B/notifications | python3 -c "import sys,json;print(sum(1 for n in json.load(sys.stdin) if not n['read']))")" "0" "marking notifications read clears every unread one"
+
+# /earnings — a doctor's fee times completed consultations
+EARN=$(curl -s -H "Authorization: Bearer $DR" $B/earnings)
+assert_eq "$(echo "$EARN" | jget '["consultations"]')" "1" "earnings count completed consultations"
+assert_eq "$(echo "$EARN" | jget '["total"]')" "600" "earnings equal fee x completed consultations"
+assert_eq "$(curl -s -H "Authorization: Bearer $PT" $B/earnings | jget '["error"]')" "Not allowed for your role" "patients cannot read doctor earnings"
+
+# --- invoice numbers stay unique and gap-free under concurrent checkout ---
+# The serial is reserved inside the order transaction under a row lock. This guards that: without
+# it, two simultaneous checkouts at one pharmacy could be handed the same tax-invoice number.
+CC_PORT=3996
+CC_DB=$(mktemp -d)/cc.db
+EPHARMA_DB=$CC_DB PORT=$CC_PORT RATE_LIMIT=100000 RATE_LIMIT_AUTH=100000 \
+  "$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$CC_PORT --noreload >/dev/null 2>&1 &
+CC_PID=$!
+CB="http://localhost:$CC_PORT/api"
+for i in $(seq 1 40); do curl -s "$CB/medicines" >/dev/null && break; sleep 0.25; done
+
+SERIALS=$("$DIR/.venv/bin/python" - "$CB" <<'CONC'
+import json, sys, urllib.request, concurrent.futures as cf
+B = sys.argv[1]
+
+def post(path, body, tok=None):
+    req = urllib.request.Request(B + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": "Bearer " + tok} if tok else {})})
+    return json.load(urllib.request.urlopen(req))
+
+tok = post("/login", {"email": "priya@gmail.com", "password": "patient123"})["token"]
+med = json.load(urllib.request.urlopen(B + "/medicines?search=Paracetamol"))[0]["id"]
+
+def checkout(_):
+    items = [{"medicine_id": med, "qty": 1}]
+    pay = post("/payments/create", {"items": items}, tok)
+    return post("/orders", {"items": items, "type": "pickup",
+                            "payment": pay["demoCheckout"]}, tok)["invoice_no"]
+
+with cf.ThreadPoolExecutor(8) as ex:
+    nos = list(ex.map(checkout, range(8)))
+seqs = sorted(int(n.rsplit("/", 1)[1]) for n in nos)
+print(f"{len(set(nos))} {seqs == list(range(1, 9))}")
+CONC
+)
+assert_eq "$(echo "$SERIALS" | cut -d' ' -f1)" "8" "8 concurrent checkouts get 8 distinct invoice numbers"
+assert_eq "$(echo "$SERIALS" | cut -d' ' -f2)" "True" "the concurrent invoice series has no gaps"
+{ kill $CC_PID; wait $CC_PID; } 2>/dev/null || true
+rm -rf "$(dirname "$CC_DB")"
+
 # --- rate limiting: excess load is shed with 429 (own server, tight limits) ---
 RL_PORT=3997
 RATE_LIMIT=1000 RATE_LIMIT_AUTH=3 EPHARMA_DB=$(mktemp -d)/rl.db PORT=$RL_PORT \
@@ -340,7 +454,7 @@ assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "$RB/health")" "200" "health
 # the default tier is separate: exhausting auth must not lock everyone out of the catalog
 assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "$RB/medicines")" "200" "auth throttling does not block the public catalog"
 
-kill $RL_PID 2>/dev/null
+{ kill $RL_PID; wait $RL_PID; } 2>/dev/null || true
 
 # --- right to erasure (run last: it destroys this patient's identity) ---
 NOPW=$(curl -s $J -H "Authorization: Bearer $PT" -d '{"password":"wrong"}' $B/me/delete | jget '["error"][:8]')
@@ -365,4 +479,11 @@ ANON=$(curl -s -H "Authorization: Bearer $AD" "$B/admin/users" | python3 -c "imp
 assert_eq "$ANON" "True" "erased account is anonymised, not deleted"
 
 echo ""
-echo "ALL TESTS PASSED"
+echo "--------------------------------------------------------------"
+if [ ${#FAILURES[@]} -eq 0 ]; then
+  echo "ALL TESTS PASSED  ($PASSED assertions)"
+else
+  echo "$PASSED passed, ${#FAILURES[@]} FAILED:"
+  for f in "${FAILURES[@]}"; do echo "  - $f"; done
+  exit 1
+fi

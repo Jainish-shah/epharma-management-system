@@ -68,7 +68,7 @@ http://localhost:3000. Fresh seed = 12 medicines, 3 doctors (2 approved), 2 phar
 ---
 
 ## If asked "what's tested?"
-`bash test.sh` → 85 automated end-to-end assertions across all roles, including OTP, validation,
+`bash test.sh` → 106 automated end-to-end assertions across all roles, including OTP, validation,
 RBAC denials, payment verification, GST invoicing, the stock ledger, consent and erasure. Passes on
 both SQLite and PostgreSQL.
 

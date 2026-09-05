@@ -51,12 +51,18 @@ Run Django and `npm run dev` side by side while developing; run the build before
 bash test.sh
 ```
 
-End-to-end API suite (91 assertions): full patient → pharmacy → doctor → admin workflow,
+End-to-end API suite (106 assertions): full patient → pharmacy → doctor → admin workflow,
 OTP-verified registration, input-validation rejections, RBAC denials, stock/oversell edge cases,
 payment signature verification, teleconsultation chat, refill reminders, admin reports,
 taxonomy management, CMS editing, consent enforcement, data export, erasure, retention,
 GST invoice numbering and tax extraction, invoice immutability, delivery assignment and the
-stock ledger, and rate limiting (429, Retry-After, health exemption). Passes on both SQLite and PostgreSQL. Uses a throwaway database — never touches demo data.
+stock ledger, rate limiting (429, Retry-After, health exemption), token revocation on logout, and
+invoice uniqueness under concurrent checkout. Passes on both SQLite and PostgreSQL. Uses a throwaway
+database — never touches demo data.
+
+Every assertion runs even after one fails; the failures are listed together at the end and the
+script exits non-zero. Against PostgreSQL the suite resets the schema first, so a run is repeatable
+— point it only at a throwaway database.
 [docs/runbook.md](docs/runbook.md) is the end-to-end operations runbook — running, verifying,
 walking the full business flow, deploying, operating, troubleshooting and recovery.
 See also [docs/system-analysis-and-development-plan.md](docs/system-analysis-and-development-plan.md)

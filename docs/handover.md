@@ -55,7 +55,7 @@ administrative reporting, catalog and content suite.
 | `epharma_site/` | Django project: settings (incl. production security), URLs, WSGI |
 | `frontend/src/` | React source — see the README for the file-by-file breakdown |
 | `public/` | **Generated** React build, committed so the app runs with Python alone |
-| `test.sh` | 91-assertion end-to-end API suite |
+| `test.sh` | 106-assertion end-to-end API suite |
 | `smoketest.sh` | Read-only post-deployment verification |
 | `loadtest.sh`, `loadtest-locust.sh`, `db-contention-test.sh` | Throughput/latency, concurrent-user load, database concurrency |
 | `Dockerfile`, `docker-compose.prod.yml`, `.env.example` | Deployment |
@@ -90,7 +90,7 @@ npm run build --prefix frontend    # rebuild public/ — commit the result
 
 | Command | What it proves |
 |---|---|
-| `bash test.sh` | 91 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
+| `bash test.sh` | 106 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating and sending security headers |
 | `bash loadtest.sh` | Throughput and latency (measured locally: ~2.1–2.9k req/s, p95 ≤ 19 ms) |
 
