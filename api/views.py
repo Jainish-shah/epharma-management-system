@@ -526,7 +526,10 @@ def medicine_stock(request, id):
     balance = med["stock"] + delta
     if balance < 0:  # a write-off cannot take more units than are on the shelf
         return J({"error": f"Only {med['stock']} in stock"}, 400)
-    with db.transaction():  # level and ledger move together or not at all
+    # immediate: take the write lock up front. A deferred transaction would upgrade from read to
+    # write on the first statement, and SQLite does not apply busy_timeout to that upgrade — under
+    # concurrent writers it fails instantly with "database is locked" instead of waiting its turn.
+    with db.transaction(immediate=True):  # level and ledger move together or not at all
         db.run("UPDATE medicines SET stock = ? WHERE id = ?", (balance, med["id"]))
         log_stock(med["id"], user["id"], delta, balance, reason, user["id"])
     db.audit(user, "stock.move", f"{med['name']} {delta:+d} ({reason})")
@@ -681,7 +684,9 @@ def _create_order(request):
         return oid
 
     try:
-        with db.transaction():  # commit on success, roll back on any raised error
+        # immediate: this is the app's hottest write path (stock, order, items, invoice serial).
+        # Deferred would upgrade read->write mid-transaction, which SQLite refuses to wait on.
+        with db.transaction(immediate=True):  # commit on success, roll back on any raised error
             order_id = place_order()
         db.audit(user, "order.placed", f"order #{order_id}")
         return J(db.get("SELECT * FROM orders WHERE id = ?", (order_id,)))

@@ -49,21 +49,29 @@ echo ""
 # opening their database connection. Measuring through that window reports the harness's own
 # start-up race as application failures — which it did, until this was added.
 wait_ready() {   # wait_ready <workers>
-  local workers=$1 attempt ok i
-  for attempt in $(seq 1 40); do
-    ok=1
-    for i in $(seq 1 $(( workers * 5 ))); do
-      curl -sf -m 2 "$B/api/medicines" >/dev/null 2>&1 || { ok=0; break; }
-    done
-    [ "$ok" = 1 ] && return 0
+  # Sequential probes are not enough: gunicorn hands each connection to whichever worker accepts
+  # first, so a serial warm-up can be answered entirely by the workers that are already up while a
+  # sibling is still importing. Fire a burst WIDER than the worker count in parallel — that forces
+  # the kernel to spread the connections — and require two clean bursts in a row before measuring.
+  local workers=$1 burst=$(( workers * 6 )) attempt clean=0
+  for attempt in $(seq 1 60); do
+    if seq 1 $burst | xargs -P "$burst" -I{} curl -sf -m 3 -o /dev/null "$B/api/medicines"; then
+      clean=$(( clean + 1 ))
+      [ "$clean" -ge 2 ] && return 0
+    else
+      clean=0
+    fi
     sleep 0.5
   done
   return 1
 }
 
 start_server() {   # start_server <extra env assignments...>
+  # gthread + keep-alive so the load generator does not exhaust its ephemeral ports; see the
+  # note in db-contention-test.sh.
   env "$@" "$DIR/.venv/bin/gunicorn" epharma_site.wsgi:application \
-      -b 127.0.0.1:$PORT -w "$WORKERS" --log-level error >"$OUT/server.log" 2>&1 &
+      -b 127.0.0.1:$PORT -w "$WORKERS" --worker-class gthread --threads 8 --keep-alive 30 \
+      --log-level error >"$OUT/server.log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 60); do
     curl -s "$B/api/health" >/dev/null 2>&1 && break

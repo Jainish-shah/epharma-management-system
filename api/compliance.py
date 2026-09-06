@@ -108,7 +108,7 @@ def erase_user(user):
     placeholder = f"erased-user-{uid}"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    with db.transaction():
+    with db.transaction(immediate=True):   # a write transaction — see the note in views.py
         db.run(
             "UPDATE users SET name = ?, email = ?, phone = NULL, address = NULL, documents = NULL, "
             "store_name = NULL, license_no = NULL, gstin = NULL, qualification = NULL, "

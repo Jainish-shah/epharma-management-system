@@ -429,19 +429,27 @@ A refused request returns **429** with a JSON body, `Retry-After`, and `RateLimi
 permissive rather than wrongly locking a user out. Move the counter to Redis when the limit has to
 be exact across workers or containers — only `_hit()` in `api/ratelimit.py` changes.
 
-**Measured capacity** (this developer machine, SQLite, gunicorn, 50 saturating clients):
+**Measured capacity** (this developer machine, SQLite, gunicorn with keep-alive, 50 saturating
+clients):
 
 | Workers | Throughput | p95 | Failures |
 |---|---|---|---|
-| 1 | ~1,350 req/s | 48 ms | 0 |
-| 2 | ~2,140 req/s | 29 ms | 0 |
-| 4 | ~2,360 req/s | 25 ms | 0 |
-| 8 | ~2,410 req/s | 28 ms | 0 |
+| 1 | ~1,580 req/s | 33 ms | 0 |
+| 2 | ~2,810 req/s | 20 ms | 0 |
+| 4 | ~3,470 req/s | 16 ms | 0 |
+| 8 | ~3,515 req/s | 16 ms | 0 |
 
-Throughput scales sharply from 1 to 2 workers and then flattens — past that point the machine's
-cores, not the application, are the limit. Under realistic load (60 users with think time) the same
-setup served ~73 req/s at a 10 ms p95, so it is idling. Re-measure on your own hardware before
-sizing: `bash db-contention-test.sh`.
+Throughput nearly doubles from 1 to 2 workers, gains again at 4, and is flat by 8 — past that point
+the machine's cores, not the application, are the limit. Under realistic load (60 users with think
+time) the same setup served ~72 req/s at a 10 ms p95, so it is idling. Re-measure on your own
+hardware before sizing: `bash db-contention-test.sh`.
+
+> The load harness runs gunicorn with `gthread` workers and keep-alive. With the default `sync`
+> workers every request opens a fresh TCP connection, and the *load generator* exhausts its
+> ephemeral ports long before the server is stressed — which shows up as thousands of
+> `Can't assign requested address` errors that look like server failures and are not. Threads do not
+> change what is being measured: they share one database connection and one lock, so database
+> concurrency per process is still 1.
 
 ### 8.8 Database connections — there is no pool
 
@@ -450,6 +458,12 @@ lock. Two consequences:
 
 1. **Inside a worker, database concurrency is 1** — however many threads the server has. Scale with
    worker processes, not threads.
+1a. **Write transactions must take the lock up front.** `db.transaction(immediate=True)` issues
+   `BEGIN IMMEDIATE`. A deferred transaction upgrades from a read lock to a write lock on its first
+   write, and SQLite deliberately does not apply `busy_timeout` to that upgrade — so under
+   concurrent writers it fails instantly with "database is locked" and the caller sees a 500 on a
+   payment they have already made. All three write paths (order placement, stock movements,
+   erasure) use `immediate=True`; `bash db-contention-test.sh` guards it.
 2. **Total connections held = workers x containers.** Size this against PostgreSQL's
    `max_connections` (minus `superuser_reserved_connections`) before scaling out. Exceeding it does
    not queue — see below.
@@ -489,6 +503,8 @@ lock. Two consequences:
 | A load test reports thousands of failures | The harness measured through worker start-up, or rate limiting was left on | Wait for every worker to serve before measuring; set `RATE_LIMIT_ENABLED=0` when measuring capacity |
 | Workers crash-loop and `/api/health` never answers | The database is unreachable or out of connection slots | See §8.8 — the connection is opened at import, so the worker dies before it can report. Free connections or restore the database, then restart |
 | Adding threads did not increase throughput | Database access is serialised per process | Add worker processes instead (§8.8) |
+| A load test reports `Can't assign requested address` | The load generator ran out of ephemeral ports, not a server error | Use keep-alive-capable workers (the harness does), widen the port range, or use fewer clients (§8.7) |
+| 500 on checkout under concurrent load | A write transaction was deferred instead of immediate | Write paths must use `db.transaction(immediate=True)` — see §8.8 |
 
 ---
 
