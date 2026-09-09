@@ -147,10 +147,9 @@ Delivered week by week, the phases above map onto these working increments:
 | Phase 5 | 10–16 Aug | PostgreSQL, encryption at rest, audit log, load & accessibility testing | ✅ Done |
 | Phase 6 | 17–23 Aug | Production deployment package (Docker, gunicorn, smoke tests) + React rewrite | ✅ Done |
 | Phase 7 | 24–30 Aug | Compliance & data governance (consent, access, erasure, retention, key rotation) | ✅ Done |
-| Phase 8 | 31 Aug – 6 Sep | Fulfilment & billing (GST invoices, delivery assignment, stock ledger) | ✅ Done |
-| Phase 9 | 31 Aug – 6 Sep | Reliability & operations (rate limiting, load testing, test hardening, runbook) | ✅ Done |
-| Phase 10 | 7–13 Sep | Remaining workflow items and final hardening | Planned |
-| Phase 11 | 14–17 Sep | Final documentation, demo and handover | Planned |
+| Phase 8 | 31 Aug – 6 Sep | Testing & reliability — load and concurrency testing, rate limiting, test-suite hardening, operations runbook; GST invoices, delivery assignment and the stock ledger delivered earlier in the same week | ✅ Done |
+| Phase 9 | 7–13 Sep | Remaining workflow items and final hardening | Planned |
+| Phase 10 | 14–17 Sep | Final documentation, demo and handover | Planned |
 
 ## 8. Testing Strategy
 
