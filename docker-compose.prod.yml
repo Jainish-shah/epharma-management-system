@@ -42,6 +42,27 @@ services:
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       KAFKA_BROKERS: ${KAFKA_BROKERS:-}
       NOTIFY_CHANNELS: ${NOTIFY_CHANNELS:-log}
+      # Compose passes ONLY the variables listed here — a setting in .env that is missing from this
+      # list is silently ignored inside the container. Everything the app reads is listed below.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-3}
+      # Rate limiting. DJANGO_TRUST_PROXY must be 1 when a proxy sits in front (the usual case for
+      # this stack), or every user arrives from the proxy's address and they all share ONE bucket.
+      # It defaults to 0 because that is the safe failure: with 1 and no proxy, any client can forge
+      # X-Forwarded-For and bypass the limit entirely.
+      DJANGO_TRUST_PROXY: ${DJANGO_TRUST_PROXY:-0}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-1}
+      RATE_LIMIT: ${RATE_LIMIT:-120}
+      RATE_LIMIT_AUTH: ${RATE_LIMIT_AUTH:-10}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-60}
+      # Compliance (Phase 7): key rotation, consent version, retention windows.
+      EPHARMA_ENC_KEY_OLD: ${EPHARMA_ENC_KEY_OLD:-}
+      POLICY_VERSION: ${POLICY_VERSION:-1.0}
+      RETAIN_OTPS_DAYS: ${RETAIN_OTPS_DAYS:-1}
+      RETAIN_TOKENS_DAYS: ${RETAIN_TOKENS_DAYS:-30}
+      RETAIN_NOTIFICATIONS_DAYS: ${RETAIN_NOTIFICATIONS_DAYS:-180}
+      RETAIN_AUDIT_DAYS: ${RETAIN_AUDIT_DAYS:-365}
+      REFILL_DAYS: ${REFILL_DAYS:-30}
+      DJANGO_HSTS_SECONDS: ${DJANGO_HSTS_SECONDS:-31536000}
     ports:
       - "${WEB_PORT:-8000}:8000"
 

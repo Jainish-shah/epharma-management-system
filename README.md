@@ -274,6 +274,7 @@ Locust is a test tool, not a runtime dependency, so install it separately:
 bash loadtest-locust.sh                 # 100 users, 60s, 4 workers
 bash loadtest-locust.sh 200 90s 8       # users, duration, workers
 bash db-contention-test.sh              # database concurrency and connection-refusal behaviour
+bash deploy-verify.sh                   # build the production stack and prove it (needs Docker)
 ```
 
 `loadtest-locust.sh` runs three scenarios against a throwaway gunicorn instance: realistic traffic
@@ -301,5 +302,7 @@ interactively (`locust -f locustfile.py --host ...` for the web UI on :8089).
   N x the configured number. It fails permissive rather than wrongly locking a user out. Move the
   counter to Redis when the limit must be exact across workers or containers — only `_hit()` changes.
 - **There is no database connection pool.** `api/db.py` opens one connection per worker process and
-  serialises access with a lock, so the unit of database concurrency is the worker process. See the
-  runbook for what this means operationally.
+  serialises access with a lock, so the unit of database concurrency is the worker process. The
+  connection is opened on first use and reopened if the database drops it, so a worker starts without
+  the database and recovers from a database restart by itself. See the runbook for what this means
+  operationally.

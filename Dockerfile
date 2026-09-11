@@ -31,7 +31,12 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"
 
-# 3 workers is a sane default for a small instance; tune with the WEB_CONCURRENCY env var.
+# Worker count comes from WEB_CONCURRENCY, which gunicorn reads as the DEFAULT for --workers.
+# It must not also appear as --workers on the command line: an explicit flag overrides the variable,
+# which is exactly how an earlier version of this file silently ignored every attempt to tune it.
+# 3 suits a small instance; set roughly 2 x CPU cores + 1, and keep the total across all containers
+# below PostgreSQL's connection limit (each worker holds one connection — see the runbook, §8.8).
+ENV WEB_CONCURRENCY=3
 CMD ["gunicorn", "epharma_site.wsgi:application", \
-     "--bind", "0.0.0.0:8000", "--workers", "3", \
+     "--bind", "0.0.0.0:8000", \
      "--access-logfile", "-", "--error-logfile", "-"]

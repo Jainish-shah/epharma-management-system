@@ -26,23 +26,69 @@ IS_PG = bool(DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresq
 if IS_PG:
     import psycopg
     from psycopg.rows import dict_row
-    # client_encoding=UTF8 so Unicode content (₹, em-dashes, names) round-trips regardless of server locale
-    _conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row, client_encoding="UTF8")
-else:
+
+
+def _connect():
+    """Open and configure a new connection."""
+    if IS_PG:
+        # client_encoding=UTF8 so Unicode content (₹, em-dashes, names) round-trips regardless of
+        # server locale. connect_timeout keeps a request from hanging while the database is down —
+        # it fails fast and the caller reports 503, inside the container health check's 5s budget.
+        return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row,
+                               client_encoding="UTF8", connect_timeout=3)
     # timeout: wait for a lock instead of failing instantly — several server workers boot at once
     # and briefly contend while creating/seeding the schema.
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None, timeout=20)
-    _conn.row_factory = sqlite3.Row
-    _conn.execute("PRAGMA busy_timeout = 20000")  # set FIRST so every later statement waits its turn
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 20000")  # set FIRST so every later statement waits its turn
     try:
         # WAL lets readers run alongside the writer. It is a persistent property of the database
         # file, so if a sibling worker is mid-switch and this fails, the mode is (or is about to be)
         # set anyway — not worth failing a boot over.
-        _conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA journal_mode = WAL")
     except sqlite3.OperationalError:
         pass
-    _conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+# The connection is opened on first use and reopened whenever the server has dropped it.
+#
+# It used to be opened once, at import. That had two failure modes, both reproduced against the
+# production stack: a worker that could not reach the database at start-up died before it could
+# serve /api/health (so the outage could not even be reported), and a database restart left every
+# worker holding a dead connection for good — health stuck at 503, every request failing, and the
+# container still marked healthy, so nothing ever restarted it.
+_conn = None
+_init_pending = False      # start-up could not reach the database; initialise on first contact
 _lock = threading.RLock()  # serialise access (dev server is threaded; one shared connection)
+
+
+def _c():
+    """The live connection, (re)opening it if needed.
+
+    A dropped PostgreSQL connection is detected by psycopg (`broken`/`closed`) after the first
+    operation on it fails, so a database restart costs one failed request per worker and the next
+    one reconnects. Raises if the database is unreachable; callers turn that into a 503/500."""
+    global _conn, _init_pending
+    with _lock:
+        if _conn is None or (IS_PG and (_conn.closed or _conn.broken)):
+            _conn = _connect()
+            if _init_pending:
+                _init_pending = False       # cleared first: init_and_seed() itself calls _c()
+                try:
+                    init_and_seed()
+                except Exception:
+                    _init_pending = True
+                    raise
+        return _conn
+
+
+def defer_init():
+    """Called when start-up could not reach the database: schema creation and seeding then run on
+    the first successful connection instead, and the worker starts regardless."""
+    global _init_pending
+    _init_pending = True
 
 
 def _sql(s):
@@ -56,14 +102,14 @@ def _sql(s):
 def query(sql, params=()):
     """Run a SELECT and return ALL matching rows as a list of dicts."""
     with _lock:
-        rows = _conn.execute(_sql(sql), params).fetchall()
+        rows = _c().execute(_sql(sql), params).fetchall()
         return rows if IS_PG else [dict(r) for r in rows]
 
 
 def get(sql, params=()):
     """Run a SELECT and return the FIRST row as a dict (or None if there is none)."""
     with _lock:
-        row = _conn.execute(_sql(sql), params).fetchone()
+        row = _c().execute(_sql(sql), params).fetchone()
         if not row:
             return None
         return row if IS_PG else dict(row)
@@ -79,12 +125,12 @@ def run(sql, params=()):
             is_insert = s.lstrip().upper().startswith("INSERT") and "ON CONFLICT" not in s.upper()
             if is_insert:
                 s = s.rstrip().rstrip(";") + " RETURNING id"
-            cur = _conn.execute(s, params)
+            cur = _c().execute(s, params)
             if is_insert:
                 r = cur.fetchone()
                 return r["id"] if r else None
             return None
-        cur = _conn.execute(sql, params)
+        cur = _c().execute(sql, params)
         return cur.lastrowid
 
 
@@ -100,9 +146,9 @@ def execute(script):
             cleaned = "\n".join(re.sub(r"--.*$", "", line) for line in script.split("\n"))
             for stmt in cleaned.split(";"):
                 if stmt.strip():
-                    _conn.execute(stmt)
+                    _c().execute(stmt)
         else:
-            _conn.executescript(script)  # SQLite handles comments and multiple statements itself
+            _c().executescript(script)  # SQLite handles comments and multiple statements itself
 
 
 # Wrap a block of writes so they all succeed together or none do:
@@ -117,15 +163,15 @@ def execute(script):
 def transaction(immediate=False):
     with _lock:
         if IS_PG:
-            with _conn.transaction():
+            with _c().transaction():
                 yield
         else:
-            _conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            _c().execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
                 yield
-                _conn.execute("COMMIT")
+                _c().execute("COMMIT")
             except Exception:
-                _conn.execute("ROLLBACK")
+                _c().execute("ROLLBACK")
                 raise
 
 
@@ -353,7 +399,7 @@ def init_and_seed():
         # PostgreSQL's CREATE TABLE IF NOT EXISTS is NOT atomic against a concurrent creation of the
         # same table (both sessions see "not exists" and one fails on pg_type). An advisory lock
         # serialises schema creation and seeding across workers; it is released in the finally block.
-        _conn.execute("SELECT pg_advisory_lock(%s)", (_INIT_LOCK_ID,))
+        _c().execute("SELECT pg_advisory_lock(%s)", (_INIT_LOCK_ID,))
     try:
         execute(_pg_schema(SCHEMA) if IS_PG else SCHEMA)
         _migrate()
@@ -368,7 +414,7 @@ def init_and_seed():
             return
     finally:
         if IS_PG:
-            _conn.execute("SELECT pg_advisory_unlock(%s)", (_INIT_LOCK_ID,))
+            _c().execute("SELECT pg_advisory_unlock(%s)", (_INIT_LOCK_ID,))
 
 
 def _seed_demo_data():

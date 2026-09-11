@@ -141,6 +141,7 @@ Three scripts, three different jobs.
 | `bash loadtest.sh` | Throughput and latency under concurrency (ApacheBench) | Before a capacity decision |
 | `bash loadtest-locust.sh` | Concurrent-user behaviour: realistic load, the throughput ceiling, and 429 shedding | Before a capacity or scaling decision |
 | `bash db-contention-test.sh` | How database concurrency scales with workers, and what happens when the database refuses a connection | When sizing workers, or after a connection incident |
+| `bash deploy-verify.sh` | Builds and runs the production stack, then proves what a smoke test cannot: worker tuning, settings pass-through, per-client rate limiting behind a proxy, and recovery from a database restart or absence | Before every release, and after any change to the Dockerfile, compose file or data layer |
 
 **`test.sh`** starts the application on a throwaway database and port, so it never touches your
 working data. Every assertion runs even after one fails, and the failures are listed together at the
@@ -337,6 +338,9 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # EPHARMA_ENC_KEY
 - [ ] Demo accounts removed (§11.2)
 - [ ] Database backups scheduled, and a restore actually tested
 - [ ] Retention purge scheduled (§8.5)
+- [ ] `DJANGO_TRUST_PROXY=1` if — and only if — a trusted proxy sets `X-Forwarded-For` (§8.7)
+- [ ] `WEB_CONCURRENCY x containers` is below PostgreSQL's `max_connections` (§8.8)
+- [ ] `bash deploy-verify.sh` passes against this release
 
 > **Empty is not unset.** Compose passes an unset variable through as an empty string, and the
 > application treats an empty value as "not configured" — so a blank `STRIPE_SECRET_KEY` silently
@@ -359,7 +363,7 @@ notification-delivery events each log a line, so a failed delivery is visible.
 
 ### 8.3 Scaling
 
-Increase gunicorn workers (`--workers`, or `WEB_CONCURRENCY`) — roughly `2 × CPU cores + 1` per
+Increase gunicorn workers with `WEB_CONCURRENCY` — roughly `2 × CPU cores + 1` per
 container — or run more containers behind the load balancer.
 
 Invoice numbering and order placement are safe across workers: the invoice counter is incremented
@@ -468,18 +472,25 @@ lock. Two consequences:
    `max_connections` (minus `superuser_reserved_connections`) before scaling out. Exceeding it does
    not queue — see below.
 
-> **Known defect — workers cannot boot without the database.** The connection is opened at module
-> import, so a worker that cannot reach the database, or that PostgreSQL refuses because
-> `max_connections` is exhausted, **dies during start-up**. It never reaches the health endpoint
-> that exists to report exactly this condition, so `/api/health` does not answer at all rather than
-> returning 503, and gunicorn crash-loops the workers until it exhausts its retry budget.
->
-> Reproduce it with `bash db-contention-test.sh` (section 2).
->
-> The fix is to open the connection lazily on first use and reconnect on failure, so a worker starts,
-> serves 503 from `/api/health`, and recovers by itself when the database returns. Until then, treat
-> a connection-budget overrun as a full outage rather than a degradation, and keep
-> `workers x containers` comfortably under the PostgreSQL limit.
+**Losing the database is a degradation, not an outage.** The connection is opened on first use and
+reopened whenever the server drops it:
+
+- A worker **starts even when the database is unreachable**. It answers `/api/health` with 503 and
+  the reason, so the load balancer can route around it, and it creates the schema and seeds the
+  moment the database appears.
+- A **database restart** — maintenance, a managed-database patch, a failover — costs one failed
+  request per worker; the next request reconnects. Verified on the production stack: health back to
+  200 about five seconds after PostgreSQL returned, with no container restart.
+- A request made while the database is down fails within 3 seconds (`connect_timeout`) rather than
+  hanging, inside the container health check's 5-second budget.
+
+Keep `workers x containers` below PostgreSQL's connection limit all the same: a worker that cannot
+get a connection still cannot serve requests — it just reports it and recovers, instead of dying.
+
+> Before Phase 9 the connection was opened at import. A worker that could not reach the database died
+> before it could report anything, and a database restart left every worker holding a dead connection
+> for good — health stuck at 503 while Docker still marked the container healthy, so nothing ever
+> restarted it. `bash deploy-verify.sh` now guards both.
 
 ## 9. Troubleshooting
 
@@ -501,7 +512,9 @@ lock. Two consequences:
 | Startup logs are empty in a custom deployment | Python is buffering stdout | Set `PYTHONUNBUFFERED=1`. The provided Dockerfile already does |
 | Clients get 429 during normal use | The window allowance is too low, or every request appears to come from the proxy | Raise `RATE_LIMIT`, or set `DJANGO_TRUST_PROXY=1` if a trusted proxy sets `X-Forwarded-For` (§8.7) |
 | A load test reports thousands of failures | The harness measured through worker start-up, or rate limiting was left on | Wait for every worker to serve before measuring; set `RATE_LIMIT_ENABLED=0` when measuring capacity |
-| Workers crash-loop and `/api/health` never answers | The database is unreachable or out of connection slots | See §8.8 — the connection is opened at import, so the worker dies before it can report. Free connections or restore the database, then restart |
+| `/api/health` returns 503 with a database error | The database is unreachable | Restore the database — each worker reconnects by itself on its next request; no restart needed (§8.8) |
+| `WEB_CONCURRENCY` has no effect | A `--workers` flag on the command line overrides it | Remove the flag; the provided Dockerfile sets only the variable |
+| A setting in `.env` has no effect in the container | Compose passes only the variables listed under `environment:` | Add it to `docker-compose.prod.yml`. `deploy-verify.sh` checks every `.env.example` setting is passed through |
 | Adding threads did not increase throughput | Database access is serialised per process | Add worker processes instead (§8.8) |
 | A load test reports `Can't assign requested address` | The load generator ran out of ephemeral ports, not a server error | Use keep-alive-capable workers (the harness does), widen the port range, or use fewer clients (§8.7) |
 | 500 on checkout under concurrent load | A write transaction was deferred instead of immediate | Write paths must use `db.transaction(immediate=True)` — see §8.8 |

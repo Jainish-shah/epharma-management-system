@@ -393,7 +393,7 @@ assert_eq "$(curl -s -H "Authorization: Bearer $PT" $B/earnings | jget '["error"
 # it, two simultaneous checkouts at one pharmacy could be handed the same tax-invoice number.
 CC_PORT=3996
 CC_DB=$(mktemp -d)/cc.db
-EPHARMA_DB=$CC_DB PORT=$CC_PORT RATE_LIMIT=100000 RATE_LIMIT_AUTH=100000 \
+env -u DATABASE_URL EPHARMA_DB=$CC_DB PORT=$CC_PORT RATE_LIMIT=100000 RATE_LIMIT_AUTH=100000 \
   "$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$CC_PORT --noreload >/dev/null 2>&1 &
 CC_PID=$!
 CB="http://localhost:$CC_PORT/api"
@@ -431,7 +431,9 @@ rm -rf "$(dirname "$CC_DB")"
 
 # --- rate limiting: excess load is shed with 429 (own server, tight limits) ---
 RL_PORT=3997
-RATE_LIMIT=1000 RATE_LIMIT_AUTH=3 EPHARMA_DB=$(mktemp -d)/rl.db PORT=$RL_PORT \
+# `env -u DATABASE_URL`: side servers must not inherit the main run's database. On PostgreSQL they
+# would otherwise share it, and their writes would leak into the counts the main suite asserts on.
+env -u DATABASE_URL RATE_LIMIT=1000 RATE_LIMIT_AUTH=3 EPHARMA_DB=$(mktemp -d)/rl.db PORT=$RL_PORT \
   "$DIR/.venv/bin/python" "$DIR/manage.py" runserver 127.0.0.1:$RL_PORT --noreload >/dev/null 2>&1 &
 RL_PID=$!
 RB="http://localhost:$RL_PORT/api"

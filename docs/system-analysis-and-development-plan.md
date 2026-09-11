@@ -148,8 +148,11 @@ Delivered week by week, the phases above map onto these working increments:
 | Phase 6 | 17–23 Aug | Production deployment package (Docker, gunicorn, smoke tests) + React rewrite | ✅ Done |
 | Phase 7 | 24–30 Aug | Compliance & data governance (consent, access, erasure, retention, key rotation) | ✅ Done |
 | Phase 8 | 31 Aug – 6 Sep | Testing & reliability — load and concurrency testing, rate limiting, test-suite hardening, operations runbook; GST invoices, delivery assignment and the stock ledger delivered earlier in the same week | ✅ Done |
-| Phase 9 | 7–13 Sep | Remaining workflow items and final hardening | Planned |
-| Phase 10 | 14–17 Sep | Final documentation, demo and handover | Planned |
+| Phase 9 | 7–13 Sep | Deployment & documentation — production stack verified end to end, deployment defects fixed, documentation finalised | ✅ Done |
+| Phase 10 | 14–17 Sep | Final demo and handover | Planned |
+
+Not yet built from the project workflow document: admin role and permission management,
+consent-gated access for a doctor to a patient's history, and pharmacy selection by location or price.
 
 ## 8. Testing Strategy
 

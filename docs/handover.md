@@ -23,7 +23,8 @@ administrative reporting, catalog and content suite.
 | 5 | Performance & security (PostgreSQL, encryption, audit log, load test, accessibility) | ✅ |
 | 6 | Deployment (Docker, gunicorn, smoke tests) and the React rewrite | ✅ |
 | 7 | Compliance & data governance (consent, access, erasure, retention, key rotation) | ✅ |
-| 8 | Fulfilment & billing (GST invoices, delivery assignment, stock ledger) | ✅ |
+| 8 | Testing & reliability (load and concurrency testing, rate limiting, test hardening); GST invoices, delivery assignment, stock ledger | ✅ |
+| 9 | Deployment & documentation (production stack verified end to end, deployment defects fixed, docs finalised) | ✅ |
 
 ---
 
@@ -57,6 +58,7 @@ administrative reporting, catalog and content suite.
 | `public/` | **Generated** React build, committed so the app runs with Python alone |
 | `test.sh` | 106-assertion end-to-end API suite |
 | `smoketest.sh` | Read-only post-deployment verification |
+| `deploy-verify.sh` | Builds and exercises the production stack, including database-restart recovery |
 | `loadtest.sh`, `loadtest-locust.sh`, `db-contention-test.sh` | Throughput/latency, concurrent-user load, database concurrency |
 | `Dockerfile`, `docker-compose.prod.yml`, `.env.example` | Deployment |
 | `docs/` | [Operations runbook](runbook.md), analysis & development plan, coding standards, deployment and demo runbooks, status reports |
@@ -92,6 +94,7 @@ npm run build --prefix frontend    # rebuild public/ — commit the result
 |---|---|
 | `bash test.sh` | 106 end-to-end assertions across all four roles — passes on **both** SQLite and PostgreSQL |
 | `bash smoketest.sh <url>` | A live deployment is healthy, serving, authenticating and sending security headers |
+| `bash deploy-verify.sh` | The production stack builds, honours its settings, rate-limits per client behind a proxy, and survives a database restart or absence |
 | `bash loadtest.sh` | Throughput and latency (measured locally: ~2.1–2.9k req/s, p95 ≤ 19 ms) |
 
 The test suite covers the money and security paths specifically: payment signature verification and

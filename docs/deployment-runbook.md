@@ -55,6 +55,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # EPHARMA_ENC_KEY
 | `EPHARMA_ENC_KEY` | yes | Encrypts prescriptions, consultation messages and documents at rest |
 | `DATABASE_URL` | yes | `postgresql://user:pass@host:5432/db`. Unset falls back to SQLite (demo only) |
 | `DJANGO_SSL_REDIRECT` | no | `0` when the proxy terminates TLS (usual). `1` makes the app redirect HTTP→HTTPS |
+| `WEB_CONCURRENCY` | no | gunicorn worker processes per container (default `3`). Each holds one database connection |
 | `PAYMENT_PROVIDER` | no | `stripe` (default) or `razorpay` |
 | `STRIPE_SECRET_KEY` / `STRIPE_PUBLISHABLE_KEY` | no | Live Stripe keys. Leave **unset** to keep the sandbox gateway |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | no | Live Razorpay keys |
@@ -64,6 +65,10 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # EPHARMA_ENC_KEY
 | `RATE_LIMIT_WINDOW` | no | Window in seconds (default `60`) |
 | `RATE_LIMIT_ENABLED` | no | `0` disables rate limiting — for load testing, not production |
 | `DJANGO_TRUST_PROXY` | no | `1` to take the client IP from `X-Forwarded-For`. **Set this behind a load balancer**, or every request shares one bucket. Never set it without a trusted proxy in front |
+
+> **Compose passes only what it lists.** A variable set in `.env` reaches the container only if it
+> appears under `environment:` in `docker-compose.prod.yml`; anything else is silently ignored.
+> `bash deploy-verify.sh` checks that every setting in `.env.example` is passed through.
 
 > **Empty is not unset.** An empty value (`STRIPE_SECRET_KEY=`) is treated as unset and falls back to
 > the default. This matters because Compose passes unset variables through as empty strings.
@@ -109,7 +114,7 @@ database answers, `503` otherwise, and reports which database, payment provider 
 **Logs** — the app logs to stdout/stderr (`docker compose logs -f web`). Payment, order and
 notification-delivery events each log a line, so a failed delivery is visible.
 
-**Scaling** — increase gunicorn workers (`--workers`, or the `WEB_CONCURRENCY` env var) or run more
+**Scaling** — increase gunicorn workers with the `WEB_CONCURRENCY` env var (default `3`) or run more
 containers behind the load balancer. Roughly `2 × CPU cores + 1` workers per container.
 
 **Backups** — back up PostgreSQL (`pg_dump`) on your provider's schedule. **Also back up
